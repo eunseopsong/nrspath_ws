@@ -17,8 +17,7 @@ int main(int argc, char **argv)
     nrs_callback callback_handler(node);
 
     // === Path Generation ===
-    callback_handler.mesh_file_path = "/home/eunseop/isaac/isaac_save/surface/surface_assembly_remesh_2.stl";
-    // callback_handler.mesh_file_path = "/home/eunseop/nrspath_ws/src/nrs_path2/mesh/flat_surface_5.stl";
+    callback_handler.mesh_file_path = "/home/eunseop/isaac/isaac_save/surface/surface_assembly.stl";
 
     callback_handler.geodesic_waypoints_file_path = "/home/eunseop/nrspath_ws/src/nrs_path2/data/geodesic_waypoints.txt";
     callback_handler.geodesic_waypoints_pub =
