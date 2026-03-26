@@ -833,12 +833,16 @@ bool nrs_geodesic::load_stl_file(std::ifstream &input, Triangle_mesh &mesh)
     std::vector<std::array<std::size_t, 3>> triangles;
 
     if (!CGAL::IO::read_STL(input, points, triangles))
-    //// if (!CGAL::read_STL(input, points, triangles))
     {
         RCLCPP_ERROR(logger_, "Failed to read STL file.");
-        //// ROS_ERROR("Failed to read STL file.");
         return false;
     }
+
+    RCLCPP_INFO(logger_, "STL read success: num_points=%zu, num_triangles=%zu",
+                points.size(), triangles.size());
+
+    // 혹시 이전 mesh 데이터가 남아 있으면 비움
+    mesh.clear();
 
     std::map<std::size_t, vertex_descriptor> index_to_vertex;
     for (std::size_t i = 0; i < points.size(); ++i)
@@ -846,16 +850,146 @@ bool nrs_geodesic::load_stl_file(std::ifstream &input, Triangle_mesh &mesh)
         index_to_vertex[i] = mesh.add_vertex(points[i]);
     }
 
-    for (const auto &t : triangles)
+    std::size_t success_faces = 0;
+    std::size_t failed_faces = 0;
+    std::size_t degenerate_faces = 0;
+    std::size_t invalid_index_faces = 0;
+
+    const double area_eps = 1e-20;
+
+    for (std::size_t face_idx = 0; face_idx < triangles.size(); ++face_idx)
     {
-        if (mesh.add_face(index_to_vertex[t[0]], index_to_vertex[t[1]], index_to_vertex[t[2]]) == Triangle_mesh::null_face())
+        const auto &t = triangles[face_idx];
+
+        std::size_t i0 = t[0];
+        std::size_t i1 = t[1];
+        std::size_t i2 = t[2];
+
+        // index 범위 검사
+        if (i0 >= points.size() || i1 >= points.size() || i2 >= points.size())
         {
-            RCLCPP_ERROR(logger_, "Failed to add face.");
-            //// ROS_ERROR("Failed to add face.");
-            return false;
+            RCLCPP_ERROR(
+                logger_,
+                "[face %zu] Invalid triangle index: tri=(%zu,%zu,%zu), num_points=%zu",
+                face_idx, i0, i1, i2, points.size());
+
+            invalid_index_faces++;
+            failed_faces++;
+            continue;
         }
+
+        const auto &p0 = points[i0];
+        const auto &p1 = points[i1];
+        const auto &p2 = points[i2];
+
+        // 같은 vertex index를 두 번 이상 쓰는 경우
+        if (i0 == i1 || i1 == i2 || i0 == i2)
+        {
+            RCLCPP_ERROR(
+                logger_,
+                "[face %zu] Degenerate triangle (duplicated vertex index): tri=(%zu,%zu,%zu)",
+                face_idx, i0, i1, i2);
+
+            RCLCPP_ERROR(
+                logger_,
+                "  p0=(%.15f, %.15f, %.15f)",
+                CGAL::to_double(p0.x()), CGAL::to_double(p0.y()), CGAL::to_double(p0.z()));
+            RCLCPP_ERROR(
+                logger_,
+                "  p1=(%.15f, %.15f, %.15f)",
+                CGAL::to_double(p1.x()), CGAL::to_double(p1.y()), CGAL::to_double(p1.z()));
+            RCLCPP_ERROR(
+                logger_,
+                "  p2=(%.15f, %.15f, %.15f)",
+                CGAL::to_double(p2.x()), CGAL::to_double(p2.y()), CGAL::to_double(p2.z()));
+
+            degenerate_faces++;
+            failed_faces++;
+            continue;
+        }
+
+        // 면적 0 근처 검사
+        Kernel::Vector_3 e1 = p1 - p0;
+        Kernel::Vector_3 e2 = p2 - p0;
+        Kernel::Vector_3 cp = CGAL::cross_product(e1, e2);
+        double area2 = CGAL::to_double(cp.squared_length());
+
+        if (area2 < area_eps)
+        {
+            RCLCPP_ERROR(
+                logger_,
+                "[face %zu] Near-zero area triangle: tri=(%zu,%zu,%zu), area2=%.30e",
+                face_idx, i0, i1, i2, area2);
+
+            RCLCPP_ERROR(
+                logger_,
+                "  p0=(%.15f, %.15f, %.15f)",
+                CGAL::to_double(p0.x()), CGAL::to_double(p0.y()), CGAL::to_double(p0.z()));
+            RCLCPP_ERROR(
+                logger_,
+                "  p1=(%.15f, %.15f, %.15f)",
+                CGAL::to_double(p1.x()), CGAL::to_double(p1.y()), CGAL::to_double(p1.z()));
+            RCLCPP_ERROR(
+                logger_,
+                "  p2=(%.15f, %.15f, %.15f)",
+                CGAL::to_double(p2.x()), CGAL::to_double(p2.y()), CGAL::to_double(p2.z()));
+
+            degenerate_faces++;
+            failed_faces++;
+            continue;
+        }
+
+        auto v0 = index_to_vertex[i0];
+        auto v1 = index_to_vertex[i1];
+        auto v2 = index_to_vertex[i2];
+
+        auto fd = mesh.add_face(v0, v1, v2);
+
+        if (fd == Triangle_mesh::null_face())
+        {
+            RCLCPP_ERROR(
+                logger_,
+                "[face %zu] Failed to add face: tri=(%zu,%zu,%zu)",
+                face_idx, i0, i1, i2);
+
+            RCLCPP_ERROR(
+                logger_,
+                "  p0=(%.15f, %.15f, %.15f)",
+                CGAL::to_double(p0.x()), CGAL::to_double(p0.y()), CGAL::to_double(p0.z()));
+            RCLCPP_ERROR(
+                logger_,
+                "  p1=(%.15f, %.15f, %.15f)",
+                CGAL::to_double(p1.x()), CGAL::to_double(p1.y()), CGAL::to_double(p1.z()));
+            RCLCPP_ERROR(
+                logger_,
+                "  p2=(%.15f, %.15f, %.15f)",
+                CGAL::to_double(p2.x()), CGAL::to_double(p2.y()), CGAL::to_double(p2.z()));
+
+            failed_faces++;
+            continue;
+        }
+
+        success_faces++;
     }
-    RCLCPP_INFO(logger_, "Successfully read STL file.");
-    //// ROS_INFO("Successfully read STL file.");
+
+    RCLCPP_INFO(logger_,
+                "STL import summary: success_faces=%zu, failed_faces=%zu, degenerate_faces=%zu, invalid_index_faces=%zu",
+                success_faces, failed_faces, degenerate_faces, invalid_index_faces);
+
+    if (success_faces == 0)
+    {
+        RCLCPP_ERROR(logger_, "No valid faces were added to the mesh.");
+        return false;
+    }
+
+    if (failed_faces > 0)
+    {
+        RCLCPP_WARN(logger_, "Mesh loaded with some failed faces. Check error logs above.");
+    }
+    else
+    {
+        RCLCPP_INFO(logger_, "Successfully read STL file with all faces added.");
+    }
+
     return true;
 }
