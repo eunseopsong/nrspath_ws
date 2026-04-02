@@ -1,0 +1,5 @@
+region_key,region_name,num_waypoints,output_file
+TOP_LEFT,1,36,cross_corner_waypoints/1.txt
+TOP_RIGHT,2,36,cross_corner_waypoints/2.txt
+BOTTOM_LEFT,3,36,cross_corner_waypoints/3.txt
+BOTTOM_RIGHT,4,36,cross_corner_waypoints/4.txt
