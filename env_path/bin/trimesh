@@ -1,4 +1,4 @@
-#!/home/eunseop/nrspath_ws/src/env_path/bin/python
+#!/home/eunseop/nrspath_ws/env_path/bin/python
 import sys
 from trimesh import __main__
 if __name__ == '__main__':
