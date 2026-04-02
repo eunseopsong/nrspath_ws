@@ -10,6 +10,7 @@ generate_offset_waypoints.py (patched + PCA uv align)
 - 평면/곡면 모두 사용 가능 (ray casting 기반)
 - 출력: x y z 텍스트
 
+
 추가 기능:
 - --uv_align pca 를 사용하면, 메쉬가 월드에서 회전돼 있어도
   메쉬 로컬 축(PCA) 기준으로 u,v를 잡아서 래스터가 "메쉬 축 정렬"되도록 함.
