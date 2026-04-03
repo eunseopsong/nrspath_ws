@@ -22,21 +22,51 @@ DO NOT activate any conda environment when building or running ROS2.
 
 # 📦 Dependencies
 
-Install all required dependencies using apt:
-
+## 1. ROS2 & Build Tools
 ```bash
 sudo apt update
 
-# ROS2 dependencies
 sudo apt install -y \
   ros-humble-desktop \
   python3-colcon-common-extensions
+```
 
-# Python dependencies (ROS message generation)
+---
+
+## 2. Python (ROS message generation)
+```bash
 sudo apt install -y \
   python3-lark \
   python3-more-itertools \
   python3-empy
+```
+
+---
+
+## 3. RealSense SDK (D435 / L515)
+```bash
+sudo apt install -y librealsense2-dev librealsense2-utils
+```
+
+---
+
+## 4. PCL (Point Cloud Library)
+```bash
+sudo apt install -y libpcl-dev
+```
+
+---
+
+## 5. CGAL
+```bash
+sudo apt install -y libcgal-dev
+```
+
+---
+
+## 6. VTK
+```bash
+sudo apt install -y libvtk9-dev
 ```
 
 ---
@@ -72,19 +102,11 @@ rm -rf ~/nrspath_ws/src/env_path
 ```bash
 cd ~/nrspath_ws
 
-# Clean previous build
 rm -rf build install log
 
-# Source ROS2
 source /opt/ros/humble/setup.bash
 
-# Build
 colcon build
-```
-
-(Optional alias)
-```bash
-alias cb='colcon build'
 ```
 
 ---
@@ -102,63 +124,28 @@ ros2 run <package_name> <node_name>
 
 # 🔍 Troubleshooting
 
-## 1. Python path issue
-
-Check python:
+## Python path issue
 
 ```bash
 which python3
 ```
 
 Must be:
-
 ```bash
 /usr/bin/python3
 ```
 
-If you see:
-
-```bash
-/anaconda3/...
-```
-
-👉 You are using conda → deactivate it:
-
+If conda path appears:
 ```bash
 conda deactivate
 ```
 
 ---
 
-## 2. Missing modules
-
-If you see errors like:
-
-```
-ModuleNotFoundError: No module named 'lark'
-ModuleNotFoundError: No module named 'more_itertools'
-```
-
-Install:
+## Missing modules
 
 ```bash
-sudo apt install python3-lark python3-more-itertools
-```
-
----
-
-## 3. rosidl / empy error
-
-Error:
-
-```
-module 'em' has no attribute 'BUFFERED_OPT'
-```
-
-Fix:
-
-```bash
-sudo apt install python3-empy
+sudo apt install python3-lark python3-more-itertools python3-empy
 ```
 
 ---
@@ -166,11 +153,8 @@ sudo apt install python3-empy
 # 🚀 Recommended Workflow
 
 ```bash
-# ROS work
 conda deactivate
 source /opt/ros/humble/setup.bash
-
-# Then build/run
 colcon build
 ```
 
@@ -178,12 +162,10 @@ colcon build
 
 # 💡 Notes
 
-- Never mix ROS2 build with conda environments
-- Use conda only for ML / RL projects separately
+- Never mix ROS2 build with conda
+- Use conda only for ML/RL separately
 - Always clean build if environment changes
 
 ---
 
 # ✅ Done
-
-If you follow this README step-by-step, the workspace should build and run without issues.
