@@ -31,8 +31,6 @@ sudo apt install -y \
   python3-colcon-common-extensions
 ```
 
----
-
 ## 2. Python (ROS message generation)
 ```bash
 sudo apt install -y \
@@ -41,32 +39,58 @@ sudo apt install -y \
   python3-empy
 ```
 
----
-
-## 3. RealSense SDK (D435 / L515)
+## 3. Cyclone DDS
 ```bash
-sudo apt install -y librealsense2-dev librealsense2-utils
+sudo apt install ros-humble-rmw-cyclonedds-cpp
 ```
 
----
-
-## 4. PCL (Point Cloud Library)
+## 4. RealSense SDK
 ```bash
-sudo apt install -y libpcl-dev
+sudo mkdir -p /etc/apt/keyrings
+
+curl -sSf https://librealsense.intel.com/Debian/librealsense.pgp | \
+sudo tee /etc/apt/keyrings/librealsense.pgp > /dev/null
+
+sudo apt-get install apt-transport-https
+
+echo "deb [signed-by=/etc/apt/keyrings/librealsense.pgp] https://librealsense.intel.com/Debian/apt-repo $(lsb_release -cs) main" | \
+sudo tee /etc/apt/sources.list.d/librealsense.list
+
+sudo apt-get update
+
+sudo apt-get install librealsense2-dkms
+sudo apt-get install librealsense2-utils
+
+# optional
+sudo apt-get install librealsense2-dev
+sudo apt-get install librealsense2-dbg
 ```
 
----
-
-## 5. CGAL
+## 5. PCL
 ```bash
-sudo apt install -y libcgal-dev
+sudo apt-get update
+sudo apt-get install pcl-tools
+sudo apt-get install -y libpcl-dev
 ```
 
----
-
-## 6. VTK
+## 6. CGAL
 ```bash
-sudo apt install -y libvtk9-dev
+sudo apt-get install libcgal-dev
+
+wget https://github.com/CGAL/cgal/releases/download/v5.6.1/CGAL-5.6.1.tar.xz
+tar xf CGAL-5.6.1.tar.xz
+cd CGAL-5.6.1
+
+mkdir build
+cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j4
+sudo make install
+```
+
+## 7. VTK
+```bash
+sudo apt-get install libvtk7-dev
 ```
 
 ---
@@ -93,6 +117,7 @@ If `env_path` exists inside `src`, remove it:
 
 ```bash
 rm -rf ~/nrspath_ws/src/env_path
+rm -rf ~/nrspath_ws/env_path
 ```
 
 ---
@@ -111,7 +136,78 @@ colcon build
 
 ---
 
-# ▶️ Run
+# ▶️ Package Run Order
+
+Open a new terminal for each long-running node when needed, and source ROS 2 + workspace first:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/nrspath_ws/install/setup.bash
+```
+
+## 1. Launch path planning
+```bash
+ros2 launch nrs_path2 path_planning.launch.py
+```
+
+## 2. Run waypoint generation node
+
+Choose the command according to the target surface mesh.
+
+### Example: workpiece_1
+```bash
+ros2 run nrs_waypoint_generator waypoint_generator \
+  --ros-args \
+  -p mesh:=/home/eunseop/isaac/isaac_save/surface/workpiece_1.stl \
+  -p region_id:=1 \
+  -p frame_id:=base_link \
+  -p publish_rate_hz:=1.0
+```
+
+### Example: workpiece_2
+```bash
+ros2 run nrs_waypoint_generator waypoint_generator \
+  --ros-args \
+  -p mesh:=/home/eunseop/isaac/isaac_save/surface/workpiece_2.stl \
+  -p region_id:=1 \
+  -p frame_id:=base_link \
+  -p publish_rate_hz:=1.0
+```
+
+### Example: workpiece_8
+```bash
+ros2 run nrs_waypoint_generator waypoint_generator \
+  --ros-args \
+  -p mesh:=/home/eunseop/isaac/isaac_save/surface/workpiece_8.stl \
+  -p region_id:=1 \
+  -p frame_id:=base_link \
+  -p publish_rate_hz:=1.0
+```
+
+Change `workpiece_X.stl` to the surface you want to use.
+Also change `region_id` to one of `1, 2, 3, 4` depending on the region to publish.
+
+## 3. Generate path
+Use either straight path or spline path:
+
+```bash
+ros2 service call /straight std_srvs/srv/Empty "{}"
+```
+
+or
+
+```bash
+ros2 service call /spline std_srvs/srv/Empty "{}"
+```
+
+## 4. Run interpolation
+```bash
+ros2 service call /interpolation std_srvs/srv/Empty "{}"
+```
+
+---
+
+# ▶️ Generic Run
 
 ```bash
 cd ~/nrspath_ws
@@ -139,8 +235,6 @@ If conda path appears:
 ```bash
 conda deactivate
 ```
-
----
 
 ## Missing modules
 
