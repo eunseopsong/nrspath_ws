@@ -17,6 +17,11 @@ public:
 
     void quaternionToRPY(double qx, double qy, double qz, double qw,
                          double &roll, double &pitch, double &yaw);
+
+    void quaternionToRotVec(double qx, double qy, double qz, double qw,
+                            double &wx, double &wy, double &wz);
+
 };
+
 
 #endif // NRS_MATH_H

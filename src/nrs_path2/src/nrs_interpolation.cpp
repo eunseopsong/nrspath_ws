@@ -515,10 +515,12 @@ nrs_path2::msg::Waypoints nrs_interpolation::interpolateXYZQF(const nrs_path2::m
     return output;
 }
 
-nrs_path2::msg::Waypoints nrs_interpolation::interpolateEnd2End(const nrs_path2::msg::Waypoints &original_waypoints, double desired_interval,
-                                                                const Triangle_mesh &mesh, double fx, double fy, double fz
-                                                                                           //// double Fx, double Fy, double Fz
-                                                                )
+nrs_path2::msg::Waypoints nrs_interpolation::interpolateEnd2End(
+    const nrs_path2::msg::Waypoints &original_waypoints,
+    double desired_interval,
+    const Triangle_mesh &mesh,
+    double fx, double fy, double fz
+)
 {
     std::vector<geometry_msgs::msg::Point> original_points;
     for (const auto &wp : original_waypoints.waypoints)
@@ -530,17 +532,25 @@ nrs_path2::msg::Waypoints nrs_interpolation::interpolateEnd2End(const nrs_path2:
         original_points.push_back(pt);
     }
 
-    std::vector<geometry_msgs::msg::Point> approach_segment = generate_segment(original_points, 1, mesh);
-    std::vector<geometry_msgs::msg::Point> retreat_segment = generate_segment(original_points, 2, mesh);
-    std::vector<geometry_msgs::msg::Point> home_segment = generate_segment(original_points, 3, mesh);
+    // 예외 처리
+    if (original_points.size() < 2)
+    {
+        RCLCPP_WARN(rclcpp::get_logger("nrs_interpolation"),
+                    "original_points size is less than 2. Returning empty waypoints.");
+        return nrs_path2::msg::Waypoints();
+    }
 
-    std::vector<geometry_msgs::msg::Point> approach_interpolated = interpolatePoints(approach_segment, 0.001, 2);
-    std::vector<geometry_msgs::msg::Point> original_interpolated = interpolatePoints(original_points, 0.001, 2);
-    std::vector<geometry_msgs::msg::Point> retreat_interpolated = interpolatePoints(retreat_segment, 0.001, 2);
-    std::vector<geometry_msgs::msg::Point> home_interpolated = interpolatePoints(home_segment, 0.001, 2);
+    // surface 위 original path만 보간
+    std::vector<geometry_msgs::msg::Point> original_interpolated =
+        interpolatePoints(original_points, 0.001, 2);
 
-    nrs_path2::msg::Waypoints waypointsXYZQ = setToolVector(approach_interpolated, original_interpolated, retreat_interpolated, home_interpolated, mesh, fx, fy, fz); //// Fx, Fy, Fz
-    nrs_path2::msg::Waypoints waypointsXYZQF = interpolateXYZQF(waypointsXYZQ, desired_interval);
+    // mesh normal을 반영하여 orientation + force 부여
+    nrs_path2::msg::Waypoints waypointsXYZQ =
+        setToolVectorOriginal(original_interpolated, mesh, fx, fy, fz);
+
+    // 최종 desired_interval로 xyz + quaternion + force 재보간
+    nrs_path2::msg::Waypoints waypointsXYZQF =
+        interpolateXYZQF(waypointsXYZQ, desired_interval);
 
     return waypointsXYZQF;
 }
