@@ -2,40 +2,58 @@
 
 This workspace contains:
 
-- `nrs_path2` : Surface processing / path planning package
-- `nrs_waypoint_generator` : Mesh-based waypoint generation + ROS2 publisher
+- `nrs_path2`: Surface processing / path planning package
+- `nrs_waypoint_generator`: Mesh-based waypoint generation and ROS 2 publisher
 
 ---
 
-# 1. Environment Setup (Python venv)
+# 1. Remove Existing Python Environment
 
-Create virtual environment:
-
-```bash
-cd ~/nrspath_ws
-python3 -m venv env_path
-source env_path/bin/activate
-```
-
-Upgrade pip:
+If you previously created a virtual environment inside the workspace, remove it first.
 
 ```bash
-python -m pip install --upgrade pip setuptools wheel
+rm -rf ~/nrspath_ws/env_path
+rm -rf ~/nrspath_ws/src/env_path
 ```
 
 ---
 
-# 2. Python Dependencies
+# 2. Create Conda Environment
+
+Create and activate a new Conda environment named `env_path`.
+
+```bash
+conda create -n env_path python=3.10 -y
+conda activate env_path
+```
+
+It is recommended to install build tools first:
+
+```bash
+pip install --upgrade pip setuptools==65.5.0 wheel
+```
+
+---
+
+# 3. Python Dependencies
 
 Required for `nrs_waypoint_generator`:
 
 ```bash
-pip install "numpy<2" scipy trimesh rtree
+pip install "numpy<2" scipy trimesh rtree catkin_pkg pyyaml jinja2 typeguard
+```
+
+If `rtree` installation fails, install the system dependency first:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libspatialindex-dev
+pip install rtree
 ```
 
 ---
 
-# 3. System Dependencies (nrs_path2 + sensors)
+# 4. System Dependencies
 
 ## Cyclone DDS
 
@@ -50,11 +68,13 @@ sudo apt install ros-humble-rmw-cyclonedds-cpp
 ```bash
 sudo mkdir -p /etc/apt/keyrings
 
-curl -sSf https://librealsense.intel.com/Debian/librealsense.pgp | sudo tee /etc/apt/keyrings/librealsense.pgp > /dev/null
+curl -sSf https://librealsense.intel.com/Debian/librealsense.pgp | \
+sudo tee /etc/apt/keyrings/librealsense.pgp > /dev/null
 
 sudo apt-get install apt-transport-https
 
-echo "deb [signed-by=/etc/apt/keyrings/librealsense.pgp] https://librealsense.intel.com/Debian/apt-repo $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/librealsense.list
+echo "deb [signed-by=/etc/apt/keyrings/librealsense.pgp] https://librealsense.intel.com/Debian/apt-repo $(lsb_release -cs) main" | \
+sudo tee /etc/apt/sources.list.d/librealsense.list
 
 sudo apt-get update
 
@@ -103,75 +123,85 @@ sudo apt-get install libvtk7-dev
 
 ---
 
-# 4. Build Workspace
+# 5. Build Workspace
+
+Before building, activate the Conda environment and source ROS 2:
+
+```bash
+conda activate env_path
+source /opt/ros/humble/setup.bash
+```
+
+Then build:
 
 ```bash
 cd ~/nrspath_ws
+rm -rf build install log
 colcon build
 source install/setup.bash
 ```
 
 ---
 
-# 5. Run
+# 6. Run
 
-## 5.1 Waypoint Generator Node
+## 6.1 Waypoint Generator Node
 
 ```bash
-ros2 run nrs_waypoint_generator waypoint_generator   --ros-args   -p mesh:=/home/eunseop/isaac/isaac_save/surface/workpiece_8.stl   -p region_id:=1   -p frame_id:=base_link   -p publish_rate_hz:=1.0
+conda activate env_path
+source /opt/ros/humble/setup.bash
+source ~/nrspath_ws/install/setup.bash
+
+ros2 run nrs_waypoint_generator waypoint_generator \
+  --ros-args \
+  -p mesh:=/home/eunseop/isaac/isaac_save/surface/workpiece_8.stl \
+  -p region_id:=1 \
+  -p frame_id:=base_link \
+  -p publish_rate_hz:=1.0
 ```
 
 ---
 
-## 5.2 Output Topic
+## 6.2 Output Topic
 
 Published topic:
 
-```
+```text
 /clicked_point  (geometry_msgs/msg/PointStamped)
 ```
 
 ---
 
-# 6. Notes
+# 7. Recommended Shell Setup
 
-- Always activate environment before running:
-
-```bash
-source ~/nrspath_ws/env_path/bin/activate
-source ~/nrspath_ws/install/setup.bash
-```
-
-- `rtree` is required for trimesh raycasting (critical dependency)
-
-- If error occurs:
-
-```
-ModuleNotFoundError: No module named 'rtree'
-```
-
-→ install:
+To avoid Python package conflicts during build:
 
 ```bash
-pip install rtree
+conda activate env_path
+export PYTHONNOUSERSITE=1
+unset PYTHONPATH
+source /opt/ros/humble/setup.bash
 ```
+
+Then build or run ROS 2 commands.
 
 ---
 
-# 7. Workspace Structure
+# 8. Workspace Structure
 
-```
+```text
 nrspath_ws/
 ├── src/
 │   ├── nrs_path2/
+│   ├── nrs_waypoint/
 │   └── nrs_waypoint_generator/
-├── env_path/
 └── README.md
 ```
 
 ---
 
-# 8. Recommended
+# 9. Notes
 
-- Do NOT place virtual environment inside `src/`
-- Keep it at workspace root (`~/nrspath_ws/env_path`)
+- Do not place Python environments inside `src/`
+- Use the Conda environment from outside the ROS package directories
+- If `colcon` scans unwanted folders, make sure no Conda or Python environment exists inside `src/`
