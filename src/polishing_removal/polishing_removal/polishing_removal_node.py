@@ -4,11 +4,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
+import os
 import threading
 from datetime import datetime
 
 import matplotlib
-matplotlib.use("Agg")
+if not os.environ.get("DISPLAY"):
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import numpy as np
@@ -19,15 +21,15 @@ from std_msgs.msg import String, Float64MultiArray
 from std_srvs.srv import Trigger
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
 
-
 # ============================================================
 # Assumptions for this node
 # - /ur10skku/currentP: [x(mm), y(mm), z(mm), wx, wy, wz]
-#   * The last three values are NOT RPY. They are logged/plotted only.
 # - /ur10skku/currentF: [fx(N), fy(N), fz(N), tx, ty, tz]
 # - Positions are already in mm.
 # - Recording starts with ~/start and stops/processes with ~/end.
 # - Only 4 PNG files are saved in the session folder.
+# - The time plot uses the SAME quantity as the heatmap:
+#   "cell removal value" sampled from the final heatmap at each timestep.
 # ============================================================
 DEFAULT_PACKAGE_NAME = "polishing_removal"
 DEFAULT_POSITION_TOPIC = "/ur10skku/currentP"
@@ -55,11 +57,13 @@ class RemovalResult:
     speed: np.ndarray          # [N]
     removal_rate: np.ndarray   # [N]
     dremoval: np.ndarray       # [N]
-    cremoval: np.ndarray       # [N]
     contact_mask: np.ndarray   # [N]
     grid_removal: np.ndarray   # [H,W]
     grid_hits: np.ndarray      # [H,W]
     grid_dt: np.ndarray        # [H,W]
+    xi: np.ndarray             # [N]
+    yi: np.ndarray             # [N]
+    heatmap_value_series: np.ndarray  # [N], sampled from final heatmap
     meta: Dict[str, float]
 
 
@@ -81,10 +85,10 @@ def parse_tool_axis(axis_str: str) -> np.ndarray:
 
 
 def fft_convolve2d(a: np.ndarray, k: np.ndarray) -> np.ndarray:
-    H, W = a.shape
+    h, w = a.shape
     kh, kw = k.shape
-    out_h = H + kh - 1
-    out_w = W + kw - 1
+    out_h = h + kh - 1
+    out_w = w + kw - 1
 
     fh = int(2 ** np.ceil(np.log2(out_h)))
     fw = int(2 ** np.ceil(np.log2(out_w)))
@@ -95,29 +99,29 @@ def fft_convolve2d(a: np.ndarray, k: np.ndarray) -> np.ndarray:
 
     start_h = (kh - 1) // 2
     start_w = (kw - 1) // 2
-    return y[start_h:start_h + H, start_w:start_w + W]
+    return y[start_h:start_h + h, start_w:start_w + w]
 
 
-def find_package_data_dir(package_name: str) -> Path:
+def find_package_logs_dir(package_name: str) -> Path:
     """
-    Prefer workspace source path: <ws>/src/<package_name>/data
-    Fallback: <install>/share/<package_name>/data
+    Prefer workspace source path: <ws>/src/<package_name>/logs
+    Fallback: <install>/share/<package_name>/logs
     """
     try:
         prefix = Path(get_package_prefix(package_name)).resolve()
         for parent in [prefix] + list(prefix.parents):
             src_pkg = parent / "src" / package_name
             if src_pkg.exists():
-                data_dir = src_pkg / "data"
-                data_dir.mkdir(parents=True, exist_ok=True)
-                return data_dir
+                logs_dir = src_pkg / "logs"
+                logs_dir.mkdir(parents=True, exist_ok=True)
+                return logs_dir
     except Exception:
         pass
 
     share_dir = Path(get_package_share_directory(package_name))
-    data_dir = share_dir / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return data_dir
+    logs_dir = share_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return logs_dir
 
 
 def compute_velocity_mm_s(t: np.ndarray, xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -174,7 +178,6 @@ def compute_removal_from_recording(
     removal_rate = np.zeros_like(fn)
     removal_rate[contact_mask] = k_preston * fn[contact_mask] * speed[contact_mask]
     dremoval = removal_rate * dt
-    cremoval = np.cumsum(dremoval)
 
     x = xyz[:, 0]
     y = xyz[:, 1]
@@ -195,6 +198,7 @@ def compute_removal_from_recording(
     grid_hits = np.zeros((H, W), dtype=float)
     grid_dt = np.zeros((H, W), dtype=float)
 
+    # Heatmap quantity: cumulative cell removal.
     np.add.at(grid_removal, (yi, xi), dremoval)
     np.add.at(grid_hits, (yi, xi), 1.0)
     np.add.at(grid_dt, (yi, xi), dt)
@@ -210,6 +214,11 @@ def compute_removal_from_recording(
             grid_hits = fft_convolve2d(grid_hits, kernel)
             grid_dt = fft_convolve2d(grid_dt, kernel)
 
+    # Time-series uses the SAME quantity as the heatmap: final cell removal value.
+    heatmap_value_series = grid_removal[yi, xi].copy()
+
+    visited = grid_hits > 0
+    grid_vals = grid_removal[visited] if np.any(visited) else np.array([0.0])
     meta = {
         "x_min": float(x_min),
         "x_max": float(x_max),
@@ -220,14 +229,13 @@ def compute_removal_from_recording(
         "contact_threshold_N": float(contact_threshold_N),
         "speed_threshold_mm_s": float(speed_threshold_mm_s),
         "pad_radius_mm": float(pad_radius_mm),
-        "mean_removal_visited": float(np.mean(grid_removal[grid_hits > 0])) if np.any(grid_hits > 0) else 0.0,
-        "std_removal_visited": float(np.std(grid_removal[grid_hits > 0])) if np.any(grid_hits > 0) else 0.0,
-        "final_cumulative_removal": float(cremoval[-1]) if cremoval.size > 0 else 0.0,
-        "duration_s": float(t[-1] - t[0]) if t.size >= 2 else 0.0,
+        "mean_heatmap_removal": float(np.mean(grid_vals)),
+        "std_heatmap_removal": float(np.std(grid_vals)),
         "samples": int(t.size),
+        "contact_samples": int(np.sum(contact_mask)),
+        "duration_s": float(t[-1] - t[0]) if t.size >= 2 else 0.0,
         "max_speed_mm_s": float(np.max(speed)) if speed.size > 0 else 0.0,
         "max_fn_N": float(np.max(fn)) if fn.size > 0 else 0.0,
-        "contact_samples": int(np.sum(contact_mask)),
         "mean_w_mag": float(np.mean(np.linalg.norm(wxyz, axis=1))) if wxyz.size > 0 else 0.0,
     }
 
@@ -241,13 +249,48 @@ def compute_removal_from_recording(
         speed=speed,
         removal_rate=removal_rate,
         dremoval=dremoval,
-        cremoval=cremoval,
         contact_mask=contact_mask,
         grid_removal=grid_removal,
         grid_hits=grid_hits,
         grid_dt=grid_dt,
+        xi=xi,
+        yi=yi,
+        heatmap_value_series=heatmap_value_series,
         meta=meta,
     )
+
+
+def create_heatmap_figure(res: RemovalResult):
+    extent = [res.meta["x_min"], res.meta["x_max"], res.meta["y_min"], res.meta["y_max"]]
+    mean_rem = float(res.meta["mean_heatmap_removal"])
+    std_rem = float(res.meta["std_heatmap_removal"])
+
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111)
+    im = ax.imshow(res.grid_removal, origin="lower", extent=extent, aspect="auto")
+    ax.set_title("Removal Heatmap")
+    ax.set_xlabel("x [mm]")
+    ax.set_ylabel("y [mm]")
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Cell removal [a.u.]")
+    text = (
+        f"mean = {mean_rem:.6f} [a.u.]\\n"
+        f"std  = {std_rem:.6f} [a.u.]\\n"
+        f"samples = {res.meta['samples']}\\n"
+        f"contact = {res.meta['contact_samples']}"
+    )
+    ax.text(
+        0.02,
+        0.98,
+        text,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=10,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+    )
+    fig.tight_layout()
+    return fig
 
 
 def save_required_plots_only(
@@ -262,53 +305,27 @@ def save_required_plots_only(
     xyz = res.state6[:, 0:3]
     wxyz = res.state6[:, 3:6]
     force3 = res.force3
-    extent = [res.meta["x_min"], res.meta["x_max"], res.meta["y_min"], res.meta["y_max"]]
-    visited = res.grid_hits > 0
-    grid_vals = res.grid_removal[visited] if np.any(visited) else np.array([0.0])
-    mean_rem = float(np.mean(grid_vals))
-    std_rem = float(np.std(grid_vals))
+    heatmap_mean = float(res.meta["mean_heatmap_removal"])
 
-    # 1) Removal heatmap with mean/std
-    fig = plt.figure(figsize=(9, 7))
-    ax = fig.add_subplot(111)
-    im = ax.imshow(res.grid_removal, origin="lower", extent=extent, aspect="auto")
-    ax.set_title("Removal Heatmap")
-    ax.set_xlabel("x [mm]")
-    ax.set_ylabel("y [mm]")
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Removal [a.u.]")
-    text = (
-        f"mean = {mean_rem:.6f} [a.u.]\n"
-        f"std  = {std_rem:.6f} [a.u.]\n"
-        f"samples = {res.meta['samples']}\n"
-        f"contact = {res.meta['contact_samples']}"
-    )
-    ax.text(
-        0.02,
-        0.98,
-        text,
-        transform=ax.transAxes,
-        va="top",
-        ha="left",
-        fontsize=10,
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
-    )
-    fig.tight_layout()
+    # 1) Removal heatmap
+    fig = create_heatmap_figure(res)
     fname = "01_removal_heatmap.png"
     fig.savefig(out_dir / fname, dpi=220)
     plt.close(fig)
     saved_files.append(fname)
 
-    # 2) Removal per step vs time (NOT cumulative)
+    # 2) Time-series of the SAME quantity as heatmap: sampled final cell removal.
     fig = plt.figure(figsize=(9, 5))
     ax = fig.add_subplot(111)
-    ax.plot(res.t, res.dremoval, linewidth=1.5)
-    ax.set_title("Removal per Step vs Time")
+    ax.plot(res.t, res.heatmap_value_series, linewidth=1.5)
+    ax.axhline(heatmap_mean, linestyle="--", linewidth=1.2, label="heatmap mean")
+    ax.set_title("Heatmap Cell Removal at Current Position vs Time")
     ax.set_xlabel("time [s]")
-    ax.set_ylabel("removal per step [a.u.]")
+    ax.set_ylabel("cell removal [a.u.]")
     ax.grid(True, alpha=0.3)
+    ax.legend()
     fig.tight_layout()
-    fname = "02_removal_vs_time.png"
+    fname = "02_heatmap_value_vs_time.png"
     fig.savefig(out_dir / fname, dpi=220)
     plt.close(fig)
     saved_files.append(fname)
@@ -339,7 +356,7 @@ def save_required_plots_only(
     plt.close(fig)
     saved_files.append(fname)
 
-    # 4) 3D trajectory + angular velocity arrows
+    # 4) 3D trajectory + angular-velocity direction arrows
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
     ax.plot(xyz[:, 0], xyz[:, 1], xyz[:, 2], linewidth=1.6, label="xyz path")
@@ -412,12 +429,13 @@ class PolishingRemovalNode(Node):
         self.force_topic = self.get_parameter("force_topic").get_parameter_value().string_value
         self.recording_rate_hz = self.get_parameter("recording_rate_hz").get_parameter_value().double_value
 
-        self.data_root = find_package_data_dir(self.package_name)
+        self.logs_root = find_package_logs_dir(self.package_name)
         self.latest_state6: Optional[np.ndarray] = None
         self.latest_force3: Optional[np.ndarray] = None
         self.recording = False
         self.record_start_time_sec: Optional[float] = None
         self.session_dir: Optional[Path] = None
+        self._heatmap_fig = None
 
         self.time_buffer: list[float] = []
         self.state_buffer: list[np.ndarray] = []
@@ -442,7 +460,7 @@ class PolishingRemovalNode(Node):
         self.get_logger().info(f"force_topic: {self.force_topic}")
         self.get_logger().info("currentP format assumed: [x, y, z, wx, wy, wz]")
         self.get_logger().info("currentF format assumed: [fx, fy, fz, tx, ty, tz]")
-        self.get_logger().info(f"data save root: {self.data_root}")
+        self.get_logger().info(f"logs save root: {self.logs_root}")
         self.get_logger().info("Services: ~/start, ~/end")
 
     def publish_status(self, text: str) -> None:
@@ -500,7 +518,7 @@ class PolishingRemovalNode(Node):
             self.force_buffer = []
 
             session_name = datetime.now().strftime("session_%Y%m%d_%H%M%S")
-            self.session_dir = self.data_root / session_name
+            self.session_dir = self.logs_root / session_name
             self.session_dir.mkdir(parents=True, exist_ok=True)
 
         self.publish_status(f"Recording started. Saving to: {self.session_dir}")
@@ -549,29 +567,37 @@ class PolishingRemovalNode(Node):
                 w_arrow_length_mm=float(self.get_parameter("w_arrow_length_mm").value),
             )
 
+            # Show heatmap window immediately after processing.
+            try:
+                self._heatmap_fig = create_heatmap_figure(res)
+                self._heatmap_fig.show()
+                plt.show(block=False)
+                plt.pause(0.001)
+                self.publish_status("Heatmap window displayed.")
+            except Exception as e:
+                self.publish_status(f"Heatmap window display skipped: {e}")
+
             summary_text = (
                 f"saved_dir: {session_dir}\n"
                 f"files: {', '.join(saved_files)}\n"
                 f"samples: {res.meta['samples']}\n"
                 f"duration_s: {res.meta['duration_s']:.6f}\n"
-                f"final_cumulative_removal: {res.meta['final_cumulative_removal']:.6f}\n"
-                f"mean_heatmap_removal: {res.meta['mean_removal_visited']:.6f}\n"
-                f"std_heatmap_removal: {res.meta['std_removal_visited']:.6f}\n"
+                f"mean_heatmap_removal: {res.meta['mean_heatmap_removal']:.6f}\n"
+                f"std_heatmap_removal: {res.meta['std_heatmap_removal']:.6f}\n"
                 f"max_speed_mm_s: {res.meta['max_speed_mm_s']:.6f}\n"
-                f"max_fn_N: {res.meta['max_fn_N']:.6f}\n"
-                f"mean_w_mag: {res.meta['mean_w_mag']:.6f}\n"
-                f"contact_samples: {res.meta['contact_samples']}"
+                f"max_fn_N: {res.meta['max_fn_N']:.6f}"
             )
             self.publish_summary(summary_text)
-            self.publish_status(f"Recording finished and saved 4 PNG files to: {session_dir}")
-
+            self.publish_status(f"Recording stopped. Saved 4 files to: {session_dir}")
             response.success = True
-            response.message = f"Saved 4 PNG files to: {session_dir}"
+            response.message = f"Saved 4 files to {session_dir}"
             return response
+
         except Exception as e:
+            err = f"Failed to process recording: {e}"
+            self.publish_status(err)
             response.success = False
-            response.message = f"Failed to process recording: {e}"
-            self.publish_status(response.message)
+            response.message = err
             return response
 
 
