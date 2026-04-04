@@ -3,152 +3,81 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Optional
+import threading
+from datetime import datetime
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import String, Float64MultiArray
 from std_srvs.srv import Trigger
+from ament_index_python.packages import get_package_prefix, get_package_share_directory
 
 
-# ----------------------------
-# Robust TXT loaders
-# ----------------------------
-
-def _load_numeric_rows(path: str, expected_cols: int) -> np.ndarray:
-    rows = []
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            if len(parts) != expected_cols:
-                continue
-            try:
-                rows.append([float(p) for p in parts])
-            except ValueError:
-                continue
-
-    if not rows:
-        raise RuntimeError(f"No valid numeric rows found in {path} (expected {expected_cols} cols).")
-    return np.asarray(rows, dtype=float)
-
-
-def load_timeseries_xyz(path: str) -> Tuple[np.ndarray, np.ndarray]:
-    arr = _load_numeric_rows(path, expected_cols=4)
-    return arr[:, 0], arr[:, 1:4]
+# ============================================================
+# Assumptions for this node
+# - /ur10skku/currentP: [x(mm), y(mm), z(mm), wx, wy, wz]
+#   * The last three values are NOT RPY. They are logged/plotted only.
+# - /ur10skku/currentF: [fx(N), fy(N), fz(N), tx, ty, tz]
+# - Positions are already in mm.
+# - Recording starts with ~/start and stops/processes with ~/end.
+# - Only 4 PNG files are saved in the session folder.
+# ============================================================
+DEFAULT_PACKAGE_NAME = "polishing_removal"
+DEFAULT_POSITION_TOPIC = "/ur10skku/currentP"
+DEFAULT_FORCE_TOPIC = "/ur10skku/currentF"
+DEFAULT_RECORDING_RATE_HZ = 50.0
+DEFAULT_TOOL_AXIS = "+Z"
+DEFAULT_SPEED_MODE = "xy"
+DEFAULT_CONTACT_THRESHOLD_N = 0.5
+DEFAULT_SPEED_THRESHOLD_MM_S = 0.1
+DEFAULT_CELL_MM = 1.0
+DEFAULT_PAD_RADIUS_MM = 20.0
+DEFAULT_K_PRESTON = 1.0
+DEFAULT_W_ARROW_STRIDE = 20
+DEFAULT_W_ARROW_LENGTH_MM = 15.0
 
 
-def load_timeseries_vxyz(path: str) -> Tuple[np.ndarray, np.ndarray]:
-    arr = _load_numeric_rows(path, expected_cols=4)
-    return arr[:, 0], arr[:, 1:4]
-
-
-def load_timeseries_fxyz(path: str) -> Tuple[np.ndarray, np.ndarray]:
-    arr = _load_numeric_rows(path, expected_cols=4)
-    return arr[:, 0], arr[:, 1:4]
-
-
-def load_timeseries_rpy(path: str) -> Tuple[np.ndarray, np.ndarray]:
-    arr = _load_numeric_rows(path, expected_cols=4)
-    return arr[:, 0], arr[:, 1:4]
-
-
-def load_waypoints_9d(path: str) -> np.ndarray:
-    return _load_numeric_rows(path, expected_cols=9)
-
-
-def interp_timeseries(t_src: np.ndarray, y_src: np.ndarray, t_ref: np.ndarray) -> np.ndarray:
-    if y_src.ndim == 1:
-        y_src = y_src[:, None]
-
-    idx = np.argsort(t_src)
-    t_sorted = t_src[idx]
-    y_sorted = y_src[idx]
-    uniq_t, uniq_idx = np.unique(t_sorted, return_index=True)
-    y_sorted = y_sorted[uniq_idx]
-
-    y_ref = np.zeros((t_ref.shape[0], y_sorted.shape[1]), dtype=float)
-    for d in range(y_sorted.shape[1]):
-        y_ref[:, d] = np.interp(t_ref, uniq_t, y_sorted[:, d])
-    return y_ref
-
-
-# ----------------------------
-# RPY -> Rotation (ZYX)
-# ----------------------------
-
-def rpy_to_R_zyx(rpy: np.ndarray) -> np.ndarray:
-    roll = rpy[:, 0]
-    pitch = rpy[:, 1]
-    yaw = rpy[:, 2]
-
-    cr = np.cos(roll)
-    sr = np.sin(roll)
-    cp = np.cos(pitch)
-    sp = np.sin(pitch)
-    cy = np.cos(yaw)
-    sy = np.sin(yaw)
-
-    R = np.zeros((rpy.shape[0], 3, 3), dtype=float)
-    R[:, 0, 0] = cy * cp
-    R[:, 0, 1] = cy * sp * sr - sy * cr
-    R[:, 0, 2] = cy * sp * cr + sy * sr
-
-    R[:, 1, 0] = sy * cp
-    R[:, 1, 1] = sy * sp * sr + cy * cr
-    R[:, 1, 2] = sy * sp * cr - cy * sr
-
-    R[:, 2, 0] = -sp
-    R[:, 2, 1] = cp * sr
-    R[:, 2, 2] = cp * cr
-    return R
+@dataclass
+class RemovalResult:
+    t: np.ndarray              # [N]
+    state6: np.ndarray         # [N,6] = [x,y,z,wx,wy,wz]
+    force3: np.ndarray         # [N,3] = [fx,fy,fz]
+    vxyz: np.ndarray           # [N,3]
+    dt: np.ndarray             # [N]
+    fn: np.ndarray             # [N]
+    speed: np.ndarray          # [N]
+    removal_rate: np.ndarray   # [N]
+    dremoval: np.ndarray       # [N]
+    cremoval: np.ndarray       # [N]
+    contact_mask: np.ndarray   # [N]
+    grid_removal: np.ndarray   # [H,W]
+    grid_hits: np.ndarray      # [H,W]
+    grid_dt: np.ndarray        # [H,W]
+    meta: Dict[str, float]
 
 
 def parse_tool_axis(axis_str: str) -> np.ndarray:
     axis_str = axis_str.strip().upper()
     if axis_str in ["+Z", "Z", "Z+", "+3"]:
-        return np.array([0.0, 0.0, 1.0])
+        return np.array([0.0, 0.0, 1.0], dtype=float)
     if axis_str in ["-Z", "Z-", "-3"]:
-        return np.array([0.0, 0.0, -1.0])
+        return np.array([0.0, 0.0, -1.0], dtype=float)
     if axis_str in ["+X", "X", "X+", "+1"]:
-        return np.array([1.0, 0.0, 0.0])
+        return np.array([1.0, 0.0, 0.0], dtype=float)
     if axis_str in ["-X", "X-", "-1"]:
-        return np.array([-1.0, 0.0, 0.0])
+        return np.array([-1.0, 0.0, 0.0], dtype=float)
     if axis_str in ["+Y", "Y", "Y+", "+2"]:
-        return np.array([0.0, 1.0, 0.0])
+        return np.array([0.0, 1.0, 0.0], dtype=float)
     if axis_str in ["-Y", "Y-", "-2"]:
-        return np.array([0.0, -1.0, 0.0])
-    raise ValueError("tool_axis must be one of ±X/±Y/±Z.")
-
-
-# ----------------------------
-# Removal model (Preston)
-# ----------------------------
-
-@dataclass
-class RemovalResult:
-    t: np.ndarray
-    xyz: np.ndarray
-    vxyz: np.ndarray
-    fxyz: np.ndarray
-    rpy: np.ndarray
-    dt: np.ndarray
-    fn: np.ndarray
-    speed: np.ndarray
-    removal_rate: np.ndarray
-    dremoval: np.ndarray
-    cremoval: np.ndarray
-    grid_removal: np.ndarray
-    grid_hits: np.ndarray
-    grid_dt: np.ndarray
-    meta: Dict[str, float]
+        return np.array([0.0, -1.0, 0.0], dtype=float)
+    raise ValueError("tool_axis must be one of ±X/±Y/±Z")
 
 
 def fft_convolve2d(a: np.ndarray, k: np.ndarray) -> np.ndarray:
@@ -169,97 +98,108 @@ def fft_convolve2d(a: np.ndarray, k: np.ndarray) -> np.ndarray:
     return y[start_h:start_h + H, start_w:start_w + W]
 
 
-def compute_removal(
-    xyz_path: str,
-    vxyz_path: str,
-    fxyz_path: str,
-    rpy_path: Optional[str],
-    cell_mm: float = 1.0,
-    k_preston: float = 1.0,
-    tool_axis: str = "-Z",
-    speed_mode: str = "xy",
-    contact_threshold_N: float = 0.5,
-    speed_threshold_mm_s: float = 0.1,
-    pad_radius_mm: float = 0.0,
-) -> RemovalResult:
-    t_xyz, xyz = load_timeseries_xyz(xyz_path)
-    t_v, vxyz = load_timeseries_vxyz(vxyz_path)
-    t_f, fxyz = load_timeseries_fxyz(fxyz_path)
+def find_package_data_dir(package_name: str) -> Path:
+    """
+    Prefer workspace source path: <ws>/src/<package_name>/data
+    Fallback: <install>/share/<package_name>/data
+    """
+    try:
+        prefix = Path(get_package_prefix(package_name)).resolve()
+        for parent in [prefix] + list(prefix.parents):
+            src_pkg = parent / "src" / package_name
+            if src_pkg.exists():
+                data_dir = src_pkg / "data"
+                data_dir.mkdir(parents=True, exist_ok=True)
+                return data_dir
+    except Exception:
+        pass
 
-    t_ref = t_xyz.copy()
-    vxyz_i = interp_timeseries(t_v, vxyz, t_ref)
-    fxyz_i = interp_timeseries(t_f, fxyz, t_ref)
+    share_dir = Path(get_package_share_directory(package_name))
+    data_dir = share_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
 
-    if rpy_path:
-        t_r, rpy = load_timeseries_rpy(rpy_path)
-        rpy_i = interp_timeseries(t_r, rpy, t_ref)
+
+def compute_velocity_mm_s(t: np.ndarray, xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    dt = np.diff(t, prepend=t[0])
+    if t.shape[0] >= 2:
+        dt0 = float(np.median(np.diff(t)))
     else:
-        rpy_i = np.zeros((t_ref.shape[0], 3), dtype=float)
-
-    dt = np.diff(t_ref, prepend=t_ref[0])
-    dt0 = np.median(np.diff(t_ref)) if t_ref.shape[0] > 2 else 0.01
-    dt[0] = dt0
+        dt0 = 1.0 / 50.0
+    dt[0] = max(dt0, 1e-6)
     dt = np.clip(dt, 1e-6, None)
 
+    vxyz = np.zeros_like(xyz)
+    if xyz.shape[0] >= 2:
+        dxyz = np.diff(xyz, axis=0)
+        dt_seg = np.diff(t)
+        dt_seg = np.clip(dt_seg, 1e-6, None)
+        vxyz[1:] = dxyz / dt_seg[:, None]
+        vxyz[0] = vxyz[1]
+    return vxyz, dt
+
+
+def compute_removal_from_recording(
+    t: np.ndarray,
+    state6: np.ndarray,
+    force3: np.ndarray,
+    cell_mm: float,
+    k_preston: float,
+    tool_axis: str,
+    speed_mode: str,
+    contact_threshold_N: float,
+    speed_threshold_mm_s: float,
+    pad_radius_mm: float,
+) -> RemovalResult:
+    xyz = state6[:, 0:3]
+    wxyz = state6[:, 3:6]
+
+    vxyz, dt = compute_velocity_mm_s(t, xyz)
+
     if speed_mode.lower() == "xy":
-        speed = np.linalg.norm(vxyz_i[:, 0:2], axis=1)
+        speed = np.linalg.norm(vxyz[:, 0:2], axis=1)
     elif speed_mode.lower() == "xyz":
-        speed = np.linalg.norm(vxyz_i, axis=1)
+        speed = np.linalg.norm(vxyz, axis=1)
     else:
         raise ValueError("speed_mode must be 'xy' or 'xyz'.")
 
-    axis_tool = parse_tool_axis(tool_axis)
-    R = rpy_to_R_zyx(rpy_i)
-    axis_base = (R @ axis_tool.reshape(3, 1)).reshape(-1, 3)
-
-    fn1 = np.sum(fxyz_i * axis_base, axis=1)
+    axis_base = parse_tool_axis(tool_axis)
+    fn1 = np.sum(force3 * axis_base[None, :], axis=1)
     fn2 = -fn1
-    m1 = np.mean(np.clip(fn1, 0.0, None))
-    m2 = np.mean(np.clip(fn2, 0.0, None))
-    fn_signed = fn1 if m1 >= m2 else fn2
-    fn = np.clip(fn_signed, 0.0, None)
+    score1 = np.mean(np.maximum(fn1, 0.0))
+    score2 = np.mean(np.maximum(fn2, 0.0))
+    fn = np.maximum(fn1 if score1 >= score2 else fn2, 0.0)
 
-    in_contact = (fn >= contact_threshold_N) & (speed >= speed_threshold_mm_s)
-
+    contact_mask = (fn >= contact_threshold_N) & (speed >= speed_threshold_mm_s)
     removal_rate = np.zeros_like(fn)
-    removal_rate[in_contact] = k_preston * fn[in_contact] * speed[in_contact]
+    removal_rate[contact_mask] = k_preston * fn[contact_mask] * speed[contact_mask]
     dremoval = removal_rate * dt
     cremoval = np.cumsum(dremoval)
 
     x = xyz[:, 0]
     y = xyz[:, 1]
-    x_min = float(np.min(x))
-    x_max = float(np.max(x))
-    y_min = float(np.min(y))
-    y_max = float(np.max(y))
-    margin = 0.5 * cell_mm
-    x_min -= margin
-    x_max += margin
-    y_min -= margin
-    y_max += margin
+    x_min = np.floor(np.min(x) / cell_mm) * cell_mm
+    x_max = np.ceil(np.max(x) / cell_mm) * cell_mm
+    y_min = np.floor(np.min(y) / cell_mm) * cell_mm
+    y_max = np.ceil(np.max(y) / cell_mm) * cell_mm
 
-    W = int(np.ceil((x_max - x_min) / cell_mm))
-    H = int(np.ceil((y_max - y_min) / cell_mm))
+    W = int(np.round((x_max - x_min) / cell_mm)) + 1
+    H = int(np.round((y_max - y_min) / cell_mm)) + 1
+    W = max(W, 1)
+    H = max(H, 1)
+
+    xi = np.clip(np.round((x - x_min) / cell_mm).astype(int), 0, W - 1)
+    yi = np.clip(np.round((y - y_min) / cell_mm).astype(int), 0, H - 1)
 
     grid_removal = np.zeros((H, W), dtype=float)
     grid_hits = np.zeros((H, W), dtype=float)
     grid_dt = np.zeros((H, W), dtype=float)
 
-    ix = np.floor((x - x_min) / cell_mm).astype(int)
-    iy = np.floor((y - y_min) / cell_mm).astype(int)
-    ix = np.clip(ix, 0, W - 1)
-    iy = np.clip(iy, 0, H - 1)
+    np.add.at(grid_removal, (yi, xi), dremoval)
+    np.add.at(grid_hits, (yi, xi), 1.0)
+    np.add.at(grid_dt, (yi, xi), dt)
 
-    for k in range(t_ref.shape[0]):
-        if not in_contact[k]:
-            continue
-        j = ix[k]
-        i = iy[k]
-        grid_removal[i, j] += dremoval[k]
-        grid_hits[i, j] += 1.0
-        grid_dt[i, j] += dt[k]
-
-    if pad_radius_mm and pad_radius_mm > 0.0:
+    if pad_radius_mm > 0.0:
         r_cells = int(np.ceil(pad_radius_mm / cell_mm))
         if r_cells >= 1:
             yy, xx = np.mgrid[-r_cells:r_cells + 1, -r_cells:r_cells + 1]
@@ -271,29 +211,38 @@ def compute_removal(
             grid_dt = fft_convolve2d(grid_dt, kernel)
 
     meta = {
-        "x_min": x_min,
-        "x_max": x_max,
-        "y_min": y_min,
-        "y_max": y_max,
+        "x_min": float(x_min),
+        "x_max": float(x_max),
+        "y_min": float(y_min),
+        "y_max": float(y_max),
         "cell_mm": float(cell_mm),
         "k_preston": float(k_preston),
         "contact_threshold_N": float(contact_threshold_N),
         "speed_threshold_mm_s": float(speed_threshold_mm_s),
         "pad_radius_mm": float(pad_radius_mm),
+        "mean_removal_visited": float(np.mean(grid_removal[grid_hits > 0])) if np.any(grid_hits > 0) else 0.0,
+        "std_removal_visited": float(np.std(grid_removal[grid_hits > 0])) if np.any(grid_hits > 0) else 0.0,
+        "final_cumulative_removal": float(cremoval[-1]) if cremoval.size > 0 else 0.0,
+        "duration_s": float(t[-1] - t[0]) if t.size >= 2 else 0.0,
+        "samples": int(t.size),
+        "max_speed_mm_s": float(np.max(speed)) if speed.size > 0 else 0.0,
+        "max_fn_N": float(np.max(fn)) if fn.size > 0 else 0.0,
+        "contact_samples": int(np.sum(contact_mask)),
+        "mean_w_mag": float(np.mean(np.linalg.norm(wxyz, axis=1))) if wxyz.size > 0 else 0.0,
     }
 
     return RemovalResult(
-        t=t_ref,
-        xyz=xyz,
-        vxyz=vxyz_i,
-        fxyz=fxyz_i,
-        rpy=rpy_i,
+        t=t,
+        state6=state6,
+        force3=force3,
+        vxyz=vxyz,
         dt=dt,
         fn=fn,
         speed=speed,
         removal_rate=removal_rate,
         dremoval=dremoval,
         cremoval=cremoval,
+        contact_mask=contact_mask,
         grid_removal=grid_removal,
         grid_hits=grid_hits,
         grid_dt=grid_dt,
@@ -301,307 +250,332 @@ def compute_removal(
     )
 
 
-def save_analysis_outputs(res: RemovalResult, out_dir: str) -> str:
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+def save_required_plots_only(
+    res: RemovalResult,
+    out_dir: Path,
+    w_arrow_stride: int,
+    w_arrow_length_mm: float,
+) -> list[str]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved_files: list[str] = []
 
-    def _plot_ts(y, title, ylabel, fname):
-        plt.figure()
-        plt.plot(res.t, y)
-        plt.title(title)
-        plt.xlabel("t [s]")
-        plt.ylabel(ylabel)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(out / fname, dpi=200)
-        plt.close()
-
-    _plot_ts(res.fn, "Normal force (auto-signed, clipped)", "Fn [N]", "ts_fn.png")
-    _plot_ts(res.speed, "Speed", "speed [mm/s]", "ts_speed.png")
-    _plot_ts(res.removal_rate, "Removal rate (relative)", "dR/dt [a.u.]", "ts_removal_rate.png")
-    _plot_ts(res.cremoval, "Cumulative removal (relative)", "R [a.u.]", "ts_cum_removal.png")
-
+    xyz = res.state6[:, 0:3]
+    wxyz = res.state6[:, 3:6]
+    force3 = res.force3
     extent = [res.meta["x_min"], res.meta["x_max"], res.meta["y_min"], res.meta["y_max"]]
+    visited = res.grid_hits > 0
+    grid_vals = res.grid_removal[visited] if np.any(visited) else np.array([0.0])
+    mean_rem = float(np.mean(grid_vals))
+    std_rem = float(np.std(grid_vals))
 
-    plt.figure()
-    plt.imshow(res.grid_removal, origin="lower", extent=extent, aspect="auto")
-    plt.title("Removal heatmap (sum per cell, relative)")
-    plt.xlabel("x [mm]")
-    plt.ylabel("y [mm]")
-    plt.colorbar(label="R_cell [a.u.]")
-    plt.tight_layout()
-    plt.savefig(out / "hm_removal_sum.png", dpi=220)
-    plt.close()
-
-    mean_rate = res.grid_removal / (res.grid_dt + 1e-12)
-    plt.figure()
-    plt.imshow(mean_rate, origin="lower", extent=extent, aspect="auto")
-    plt.title("Removal rate heatmap (R_cell / dt_cell)")
-    plt.xlabel("x [mm]")
-    plt.ylabel("y [mm]")
-    plt.colorbar(label="R/dt [a.u./s]")
-    plt.tight_layout()
-    plt.savefig(out / "hm_removal_rate.png", dpi=220)
-    plt.close()
-
-    plt.figure()
-    plt.imshow(res.grid_hits, origin="lower", extent=extent, aspect="auto")
-    plt.title("Hit-count heatmap (samples per cell)")
-    plt.xlabel("x [mm]")
-    plt.ylabel("y [mm]")
-    plt.colorbar(label="hits [-]")
-    plt.tight_layout()
-    plt.savefig(out / "hm_hits.png", dpi=220)
-    plt.close()
-
-    np.savez_compressed(
-        out / "removal_map.npz",
-        grid_removal=res.grid_removal,
-        grid_hits=res.grid_hits,
-        grid_dt=res.grid_dt,
-        meta=np.array([res.meta[k] for k in ["x_min", "x_max", "y_min", "y_max", "cell_mm"]], dtype=float),
-        meta_keys=np.array(["x_min", "x_max", "y_min", "y_max", "cell_mm"]),
+    # 1) Removal heatmap with mean/std
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111)
+    im = ax.imshow(res.grid_removal, origin="lower", extent=extent, aspect="auto")
+    ax.set_title("Removal Heatmap")
+    ax.set_xlabel("x [mm]")
+    ax.set_ylabel("y [mm]")
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Removal [a.u.]")
+    text = (
+        f"mean = {mean_rem:.6f} [a.u.]\n"
+        f"std  = {std_rem:.6f} [a.u.]\n"
+        f"samples = {res.meta['samples']}\n"
+        f"contact = {res.meta['contact_samples']}"
     )
-
-    summary = (
-        f"Samples (xyz): {res.t.shape[0]}\n"
-        f"dt median: {np.median(res.dt):.6f} s\n"
-        f"Contact threshold: Fn>={res.meta['contact_threshold_N']:.3f} N, speed>={res.meta['speed_threshold_mm_s']:.3f} mm/s\n"
-        f"Contact samples: {int(np.sum((res.fn >= res.meta['contact_threshold_N']) & (res.speed >= res.meta['speed_threshold_mm_s'])))}\n"
-        f"Cumulative removal (relative): {res.cremoval[-1]:.6f}\n"
-        f"Grid: HxW={res.grid_removal.shape[0]}x{res.grid_removal.shape[1]}, cell={res.meta['cell_mm']:.3f} mm\n"
+    ax.text(
+        0.02,
+        0.98,
+        text,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=10,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
     )
-    (out / "summary.txt").write_text(summary, encoding="utf-8")
-    return str(out)
+    fig.tight_layout()
+    fname = "01_removal_heatmap.png"
+    fig.savefig(out_dir / fname, dpi=220)
+    plt.close(fig)
+    saved_files.append(fname)
 
+    # 2) Removal per step vs time (NOT cumulative)
+    fig = plt.figure(figsize=(9, 5))
+    ax = fig.add_subplot(111)
+    ax.plot(res.t, res.dremoval, linewidth=1.5)
+    ax.set_title("Removal per Step vs Time")
+    ax.set_xlabel("time [s]")
+    ax.set_ylabel("removal per step [a.u.]")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fname = "02_removal_vs_time.png"
+    fig.savefig(out_dir / fname, dpi=220)
+    plt.close(fig)
+    saved_files.append(fname)
 
-def load_removal_npz(npz_path: str) -> Tuple[np.ndarray, Dict[str, float]]:
-    data = np.load(npz_path, allow_pickle=True)
-    grid = data["grid_removal"]
-    meta_vals = data["meta"]
-    meta_keys = data["meta_keys"]
-    meta = {str(k): float(v) for k, v in zip(meta_keys, meta_vals)}
-    return grid, meta
+    # 3) Subplots: x y z wx wy wz fx fy fz
+    labels = [
+        (xyz[:, 0], "x [mm]"),
+        (xyz[:, 1], "y [mm]"),
+        (xyz[:, 2], "z [mm]"),
+        (wxyz[:, 0], "wx"),
+        (wxyz[:, 1], "wy"),
+        (wxyz[:, 2], "wz"),
+        (force3[:, 0], "fx [N]"),
+        (force3[:, 1], "fy [N]"),
+        (force3[:, 2], "fz [N]"),
+    ]
+    fig, axes = plt.subplots(3, 3, figsize=(14, 9), sharex=True)
+    for ax, (y, ylabel) in zip(axes.ravel(), labels):
+        ax.plot(res.t, y, linewidth=1.3)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+    for ax in axes[-1, :]:
+        ax.set_xlabel("time [s]")
+    fig.suptitle("Recorded Signals: x y z wx wy wz fx fy fz")
+    fig.tight_layout(rect=[0, 0.02, 1, 0.97])
+    fname = "03_signals_subplot.png"
+    fig.savefig(out_dir / fname, dpi=220)
+    plt.close(fig)
+    saved_files.append(fname)
 
+    # 4) 3D trajectory + angular velocity arrows
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot(xyz[:, 0], xyz[:, 1], xyz[:, 2], linewidth=1.6, label="xyz path")
 
-def bilinear_sample(grid: np.ndarray, x: np.ndarray, y: np.ndarray, meta: Dict[str, float]) -> np.ndarray:
-    x_min = meta["x_min"]
-    y_min = meta["y_min"]
-    cell = meta["cell_mm"]
-    H, W = grid.shape
-    gx = (x - x_min) / cell
-    gy = (y - y_min) / cell
-    gx = np.clip(gx, 0.0, W - 1.000001)
-    gy = np.clip(gy, 0.0, H - 1.000001)
+    stride = max(int(w_arrow_stride), 1)
+    idx = np.arange(0, xyz.shape[0], stride)
+    if idx.size > 0:
+        xyz_s = xyz[idx]
+        w_s = wxyz[idx]
+        w_norm = np.linalg.norm(w_s, axis=1, keepdims=True)
+        valid = (w_norm[:, 0] > 1e-12)
+        if np.any(valid):
+            dirs = np.zeros_like(w_s)
+            dirs[valid] = w_s[valid] / w_norm[valid]
+            ax.quiver(
+                xyz_s[valid, 0], xyz_s[valid, 1], xyz_s[valid, 2],
+                dirs[valid, 0], dirs[valid, 1], dirs[valid, 2],
+                length=float(w_arrow_length_mm),
+                normalize=False,
+                linewidth=0.8,
+                arrow_length_ratio=0.25,
+            )
 
-    x0 = np.floor(gx).astype(int)
-    y0 = np.floor(gy).astype(int)
-    x1 = np.clip(x0 + 1, 0, W - 1)
-    y1 = np.clip(y0 + 1, 0, H - 1)
+    ax.set_title("3D Path with Angular-Velocity Direction (wx, wy, wz)")
+    ax.set_xlabel("x [mm]")
+    ax.set_ylabel("y [mm]")
+    ax.set_zlabel("z [mm]")
+    ax.legend(loc="best")
 
-    wx = gx - x0
-    wy = gy - y0
+    x_range = float(np.ptp(xyz[:, 0])) if xyz.shape[0] > 0 else 1.0
+    y_range = float(np.ptp(xyz[:, 1])) if xyz.shape[0] > 0 else 1.0
+    z_range = float(np.ptp(xyz[:, 2])) if xyz.shape[0] > 0 else 1.0
+    max_range = max(x_range, y_range, z_range, 1.0)
+    x_mid = float(np.mean([np.min(xyz[:, 0]), np.max(xyz[:, 0])]))
+    y_mid = float(np.mean([np.min(xyz[:, 1]), np.max(xyz[:, 1])]))
+    z_mid = float(np.mean([np.min(xyz[:, 2]), np.max(xyz[:, 2])]))
+    ax.set_xlim(x_mid - max_range / 2, x_mid + max_range / 2)
+    ax.set_ylim(y_mid - max_range / 2, y_mid + max_range / 2)
+    ax.set_zlim(z_mid - max_range / 2, z_mid + max_range / 2)
 
-    v00 = grid[y0, x0]
-    v10 = grid[y0, x1]
-    v01 = grid[y1, x0]
-    v11 = grid[y1, x1]
-    v0 = v00 * (1 - wx) + v10 * wx
-    v1 = v01 * (1 - wx) + v11 * wx
-    return v0 * (1 - wy) + v1 * wy
+    fig.tight_layout()
+    fname = "04_3d_path_w.png"
+    fig.savefig(out_dir / fname, dpi=220)
+    plt.close(fig)
+    saved_files.append(fname)
 
-
-def resample_waypoints_weighted(wp: np.ndarray, weight: np.ndarray, n_out: int) -> np.ndarray:
-    d = np.linalg.norm(np.diff(wp[:, 0:3], axis=0), axis=1)
-    s = np.concatenate([[0.0], np.cumsum(d)])
-    if s[-1] <= 1e-9:
-        return np.repeat(wp[0:1], n_out, axis=0)
-
-    w = np.clip(weight, 1e-6, None)
-    ds = np.diff(s)
-    cw = np.zeros_like(s)
-    cw[1:] = np.cumsum(0.5 * (w[:-1] + w[1:]) * ds)
-
-    total = cw[-1]
-    target = np.linspace(0.0, total, n_out)
-    s_target = np.interp(target, cw, s)
-
-    out = np.zeros((n_out, wp.shape[1]), dtype=float)
-    for col in range(wp.shape[1]):
-        out[:, col] = np.interp(s_target, s, wp[:, col])
-    return out
-
-
-def regen_waypoints(
-    waypoint_path: str,
-    removal_npz_path: str,
-    out_path: str,
-    n_out: Optional[int],
-    gain: float = 1.0,
-    w_min: float = 0.3,
-    w_max: float = 3.0,
-    eps: float = 1e-9,
-    smooth_window: int = 0,
-) -> None:
-    wp = load_waypoints_9d(waypoint_path)
-    grid, meta = load_removal_npz(removal_npz_path)
-
-    rem_i = bilinear_sample(grid, wp[:, 0], wp[:, 1], meta)
-    mean_rem = float(np.mean(rem_i[rem_i > 0])) if np.any(rem_i > 0) else float(np.mean(rem_i))
-
-    weight = (mean_rem / (rem_i + eps)) ** gain
-    weight = np.clip(weight, w_min, w_max)
-
-    if smooth_window and smooth_window >= 3:
-        k = smooth_window
-        pad = k // 2
-        wpad = np.pad(weight, (pad, pad), mode="reflect")
-        kernel = np.ones(k) / k
-        weight = np.convolve(wpad, kernel, mode="valid")
-
-    if n_out is None:
-        n_out = wp.shape[0]
-
-    wp_new = resample_waypoints_weighted(wp, weight, n_out)
-    out_path_obj = Path(out_path)
-    out_path_obj.parent.mkdir(parents=True, exist_ok=True)
-    np.savetxt(out_path_obj, wp_new, fmt="%.6f", delimiter="\t")
-
-    dbg = out_path_obj.with_suffix(".debug.txt")
-    dbg.write_text(
-        f"Input waypoints: {wp.shape[0]}\n"
-        f"Output waypoints: {wp_new.shape[0]}\n"
-        f"gain={gain}, w_min={w_min}, w_max={w_max}, smooth_window={smooth_window}\n"
-        f"mean_rem={mean_rem:.6e}\n"
-        f"weight stats: min={weight.min():.3f}, mean={weight.mean():.3f}, max={weight.max():.3f}\n",
-        encoding="utf-8",
-    )
+    return saved_files
 
 
 class PolishingRemovalNode(Node):
     def __init__(self) -> None:
         super().__init__("polishing_removal_node")
 
-        # file paths
-        self.declare_parameter("xyz_path", "")
-        self.declare_parameter("vxyz_path", "")
-        self.declare_parameter("fxyz_path", "")
-        self.declare_parameter("rpy_path", "")
-        self.declare_parameter("waypoint_path", "")
-        self.declare_parameter("removal_npz_path", "")
-        self.declare_parameter("out_dir", "./polishing_analysis")
-        self.declare_parameter("regenerated_waypoint_path", "./real_flat_filtered_new.txt")
+        self.declare_parameter("package_name", DEFAULT_PACKAGE_NAME)
+        self.declare_parameter("position_topic", DEFAULT_POSITION_TOPIC)
+        self.declare_parameter("force_topic", DEFAULT_FORCE_TOPIC)
+        self.declare_parameter("recording_rate_hz", DEFAULT_RECORDING_RATE_HZ)
+        self.declare_parameter("tool_axis", DEFAULT_TOOL_AXIS)
+        self.declare_parameter("speed_mode", DEFAULT_SPEED_MODE)
+        self.declare_parameter("contact_threshold_N", DEFAULT_CONTACT_THRESHOLD_N)
+        self.declare_parameter("speed_threshold_mm_s", DEFAULT_SPEED_THRESHOLD_MM_S)
+        self.declare_parameter("cell_mm", DEFAULT_CELL_MM)
+        self.declare_parameter("pad_radius_mm", DEFAULT_PAD_RADIUS_MM)
+        self.declare_parameter("k_preston", DEFAULT_K_PRESTON)
+        self.declare_parameter("w_arrow_stride", DEFAULT_W_ARROW_STRIDE)
+        self.declare_parameter("w_arrow_length_mm", DEFAULT_W_ARROW_LENGTH_MM)
 
-        # analyze params
-        self.declare_parameter("cell_mm", 1.0)
-        self.declare_parameter("k_preston", 1.0)
-        self.declare_parameter("tool_axis", "-Z")
-        self.declare_parameter("speed_mode", "xy")
-        self.declare_parameter("contact_threshold_N", 0.5)
-        self.declare_parameter("speed_threshold_mm_s", 0.1)
-        self.declare_parameter("pad_radius_mm", 0.0)
+        self.package_name = self.get_parameter("package_name").get_parameter_value().string_value
+        self.position_topic = self.get_parameter("position_topic").get_parameter_value().string_value
+        self.force_topic = self.get_parameter("force_topic").get_parameter_value().string_value
+        self.recording_rate_hz = self.get_parameter("recording_rate_hz").get_parameter_value().double_value
 
-        # regen params
-        self.declare_parameter("n_out", 0)
-        self.declare_parameter("gain", 1.0)
-        self.declare_parameter("w_min", 0.3)
-        self.declare_parameter("w_max", 3.0)
-        self.declare_parameter("smooth_window", 0)
+        self.data_root = find_package_data_dir(self.package_name)
+        self.latest_state6: Optional[np.ndarray] = None
+        self.latest_force3: Optional[np.ndarray] = None
+        self.recording = False
+        self.record_start_time_sec: Optional[float] = None
+        self.session_dir: Optional[Path] = None
+
+        self.time_buffer: list[float] = []
+        self.state_buffer: list[np.ndarray] = []
+        self.force_buffer: list[np.ndarray] = []
+
+        self._lock = threading.Lock()
 
         self.status_pub = self.create_publisher(String, "~/status", 10)
         self.summary_pub = self.create_publisher(String, "~/summary", 10)
 
-        self.analyze_srv = self.create_service(Trigger, "~/analyze", self.handle_analyze)
-        self.regen_srv = self.create_service(Trigger, "~/regen", self.handle_regen)
+        self.pose_sub = self.create_subscription(Float64MultiArray, self.position_topic, self.position_callback, 10)
+        self.force_sub = self.create_subscription(Float64MultiArray, self.force_topic, self.force_callback, 10)
+
+        self.start_srv = self.create_service(Trigger, "~/start", self.handle_start)
+        self.end_srv = self.create_service(Trigger, "~/end", self.handle_end)
+
+        timer_period = 1.0 / max(self.recording_rate_hz, 1e-3)
+        self.record_timer = self.create_timer(timer_period, self.record_timer_callback)
 
         self.get_logger().info("polishing_removal_node started")
-        self.get_logger().info("Services: ~/analyze, ~/regen")
+        self.get_logger().info(f"position_topic: {self.position_topic}")
+        self.get_logger().info(f"force_topic: {self.force_topic}")
+        self.get_logger().info("currentP format assumed: [x, y, z, wx, wy, wz]")
+        self.get_logger().info("currentF format assumed: [fx, fy, fz, tx, ty, tz]")
+        self.get_logger().info(f"data save root: {self.data_root}")
+        self.get_logger().info("Services: ~/start, ~/end")
 
-    def _get_param(self, name: str):
-        return self.get_parameter(name).value
-
-    def _publish_text(self, topic_pub, text: str) -> None:
+    def publish_status(self, text: str) -> None:
         msg = String()
         msg.data = text
-        topic_pub.publish(msg)
+        self.status_pub.publish(msg)
+        self.get_logger().info(text)
 
-    def handle_analyze(self, request, response):
+    def publish_summary(self, text: str) -> None:
+        msg = String()
+        msg.data = text
+        self.summary_pub.publish(msg)
+
+    def position_callback(self, msg: Float64MultiArray) -> None:
+        data = np.asarray(msg.data, dtype=float)
+        if data.size < 6:
+            self.get_logger().warn("Received currentP with fewer than 6 elements. Ignored.")
+            return
+        with self._lock:
+            self.latest_state6 = data[:6].copy()
+
+    def force_callback(self, msg: Float64MultiArray) -> None:
+        data = np.asarray(msg.data, dtype=float)
+        if data.size < 3:
+            self.get_logger().warn("Received currentF with fewer than 3 elements. Ignored.")
+            return
+        with self._lock:
+            self.latest_force3 = data[:3].copy()
+
+    def record_timer_callback(self) -> None:
+        with self._lock:
+            if not self.recording:
+                return
+            if self.latest_state6 is None or self.latest_force3 is None or self.record_start_time_sec is None:
+                return
+
+            now_sec = self.get_clock().now().nanoseconds * 1e-9
+            t_rel = now_sec - self.record_start_time_sec
+            self.time_buffer.append(float(t_rel))
+            self.state_buffer.append(self.latest_state6.copy())
+            self.force_buffer.append(self.latest_force3.copy())
+
+    def handle_start(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         del request
+        with self._lock:
+            if self.recording:
+                response.success = False
+                response.message = "Recording is already running."
+                return response
+
+            self.recording = True
+            self.record_start_time_sec = self.get_clock().now().nanoseconds * 1e-9
+            self.time_buffer = []
+            self.state_buffer = []
+            self.force_buffer = []
+
+            session_name = datetime.now().strftime("session_%Y%m%d_%H%M%S")
+            self.session_dir = self.data_root / session_name
+            self.session_dir.mkdir(parents=True, exist_ok=True)
+
+        self.publish_status(f"Recording started. Saving to: {self.session_dir}")
+        response.success = True
+        response.message = f"Recording started. Output dir: {self.session_dir}"
+        return response
+
+    def handle_end(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        del request
+        with self._lock:
+            if not self.recording:
+                response.success = False
+                response.message = "Recording is not running."
+                return response
+
+            self.recording = False
+            t = np.asarray(self.time_buffer, dtype=float)
+            state6 = np.asarray(self.state_buffer, dtype=float)
+            force3 = np.asarray(self.force_buffer, dtype=float)
+            session_dir = self.session_dir
+
+        if t.size < 2 or state6.shape[0] < 2 or force3.shape[0] < 2:
+            response.success = False
+            response.message = "Not enough recorded samples to process."
+            self.publish_status(response.message)
+            return response
+
         try:
-            xyz_path = self._get_param("xyz_path")
-            vxyz_path = self._get_param("vxyz_path")
-            fxyz_path = self._get_param("fxyz_path")
-            rpy_path = self._get_param("rpy_path") or None
-            out_dir = self._get_param("out_dir")
-
-            res = compute_removal(
-                xyz_path=xyz_path,
-                vxyz_path=vxyz_path,
-                fxyz_path=fxyz_path,
-                rpy_path=rpy_path,
-                cell_mm=float(self._get_param("cell_mm")),
-                k_preston=float(self._get_param("k_preston")),
-                tool_axis=str(self._get_param("tool_axis")),
-                speed_mode=str(self._get_param("speed_mode")),
-                contact_threshold_N=float(self._get_param("contact_threshold_N")),
-                speed_threshold_mm_s=float(self._get_param("speed_threshold_mm_s")),
-                pad_radius_mm=float(self._get_param("pad_radius_mm")),
+            res = compute_removal_from_recording(
+                t=t,
+                state6=state6,
+                force3=force3,
+                cell_mm=float(self.get_parameter("cell_mm").value),
+                k_preston=float(self.get_parameter("k_preston").value),
+                tool_axis=str(self.get_parameter("tool_axis").value),
+                speed_mode=str(self.get_parameter("speed_mode").value),
+                contact_threshold_N=float(self.get_parameter("contact_threshold_N").value),
+                speed_threshold_mm_s=float(self.get_parameter("speed_threshold_mm_s").value),
+                pad_radius_mm=float(self.get_parameter("pad_radius_mm").value),
             )
-            saved_dir = save_analysis_outputs(res, out_dir)
+            assert session_dir is not None
+            saved_files = save_required_plots_only(
+                res,
+                session_dir,
+                w_arrow_stride=int(self.get_parameter("w_arrow_stride").value),
+                w_arrow_length_mm=float(self.get_parameter("w_arrow_length_mm").value),
+            )
 
-            summary_path = Path(saved_dir) / "summary.txt"
-            summary_txt = summary_path.read_text(encoding="utf-8") if summary_path.exists() else "analyze done"
-
-            self._publish_text(self.status_pub, f"analyze done: {saved_dir}")
-            self._publish_text(self.summary_pub, summary_txt)
+            summary_text = (
+                f"saved_dir: {session_dir}\n"
+                f"files: {', '.join(saved_files)}\n"
+                f"samples: {res.meta['samples']}\n"
+                f"duration_s: {res.meta['duration_s']:.6f}\n"
+                f"final_cumulative_removal: {res.meta['final_cumulative_removal']:.6f}\n"
+                f"mean_heatmap_removal: {res.meta['mean_removal_visited']:.6f}\n"
+                f"std_heatmap_removal: {res.meta['std_removal_visited']:.6f}\n"
+                f"max_speed_mm_s: {res.meta['max_speed_mm_s']:.6f}\n"
+                f"max_fn_N: {res.meta['max_fn_N']:.6f}\n"
+                f"mean_w_mag: {res.meta['mean_w_mag']:.6f}\n"
+                f"contact_samples: {res.meta['contact_samples']}"
+            )
+            self.publish_summary(summary_text)
+            self.publish_status(f"Recording finished and saved 4 PNG files to: {session_dir}")
 
             response.success = True
-            response.message = f"Analyze completed. Output saved to: {saved_dir}"
-            self.get_logger().info(response.message)
+            response.message = f"Saved 4 PNG files to: {session_dir}"
             return response
         except Exception as e:
             response.success = False
-            response.message = f"Analyze failed: {e}"
-            self._publish_text(self.status_pub, response.message)
-            self.get_logger().error(response.message)
-            return response
-
-    def handle_regen(self, request, response):
-        del request
-        try:
-            waypoint_path = self._get_param("waypoint_path")
-            removal_npz_path = self._get_param("removal_npz_path")
-            out_path = self._get_param("regenerated_waypoint_path")
-            n_out_raw = int(self._get_param("n_out"))
-            n_out = None if n_out_raw == 0 else n_out_raw
-
-            regen_waypoints(
-                waypoint_path=waypoint_path,
-                removal_npz_path=removal_npz_path,
-                out_path=out_path,
-                n_out=n_out,
-                gain=float(self._get_param("gain")),
-                w_min=float(self._get_param("w_min")),
-                w_max=float(self._get_param("w_max")),
-                smooth_window=int(self._get_param("smooth_window")),
-            )
-
-            debug_path = str(Path(out_path).with_suffix(".debug.txt"))
-            self._publish_text(self.status_pub, f"regen done: {out_path}")
-
-            response.success = True
-            response.message = f"Regen completed. Waypoints: {out_path}, debug: {debug_path}"
-            self.get_logger().info(response.message)
-            return response
-        except Exception as e:
-            response.success = False
-            response.message = f"Regen failed: {e}"
-            self._publish_text(self.status_pub, response.message)
-            self.get_logger().error(response.message)
+            response.message = f"Failed to process recording: {e}"
+            self.publish_status(response.message)
             return response
 
 
-def main(args=None):
+def main(args=None) -> None:
     rclpy.init(args=args)
     node = PolishingRemovalNode()
     try:
