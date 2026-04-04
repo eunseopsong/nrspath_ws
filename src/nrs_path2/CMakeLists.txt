@@ -193,8 +193,6 @@ target_link_libraries(path_projection_wo_interp ${LINK_LIBS})
 install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 install(DIRECTORY include/ DESTINATION share/${PROJECT_NAME}/include)
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch)
-install(DIRECTORY rviz/ DESTINATION share/${PROJECT_NAME}/rviz)
-install(DIRECTORY urdf/ DESTINATION share/${PROJECT_NAME}/urdf)
 install(DIRECTORY mesh/ DESTINATION share/${PROJECT_NAME}/mesh)
 
 install(TARGETS
