@@ -567,13 +567,14 @@ class PolishingRemovalNode(Node):
                 w_arrow_length_mm=float(self.get_parameter("w_arrow_length_mm").value),
             )
 
-            # Show heatmap window immediately after processing.
+            # Show heatmap window immediately after all PNG files are saved.
+            # Note: plain plt.show() is blocking on most backends, so the service
+            # response may return after the user closes the figure window.
             try:
                 self._heatmap_fig = create_heatmap_figure(res)
-                self._heatmap_fig.show()
-                plt.show(block=False)
-                plt.pause(0.001)
-                self.publish_status("Heatmap window displayed.")
+                self.publish_status("All PNG files saved. Opening heatmap window...")
+                plt.show()
+                self.publish_status("Heatmap window closed.")
             except Exception as e:
                 self.publish_status(f"Heatmap window display skipped: {e}")
 
