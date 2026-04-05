@@ -4,6 +4,7 @@
 #include <array>
 #include <iostream>
 
+
 using std::placeholders::_1;
 using PointStamped = geometry_msgs::msg::PointStamped;
 
