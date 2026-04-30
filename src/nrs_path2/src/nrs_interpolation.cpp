@@ -1,584 +1,437 @@
 #include "nrs_interpolation.h"
+
+#include <CGAL/Polygon_mesh_processing/compute_normal.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
-#include <CGAL/Polygon_mesh_processing/compute_normal.h>
-#include <CGAL/Polygon_mesh_processing/locate.h>
 
-// 세그먼트 생성 함수 구현
-std::vector<geometry_msgs::msg::Point> nrs_interpolation::generate_segment(std::vector<geometry_msgs::msg::Point> &original_points,
-                                                                      int option,
-                                                                      const Triangle_mesh &mesh)
+#include <Eigen/Core>
+#include <cmath>
+#include <vector>
+
+namespace
 {
-    geometry_msgs::msg::Point start_point = original_points.front();
-    geometry_msgs::msg::Point end_point = original_points.back();
-    // 첫 번째와 마지막 점에서 face의 normal vector 구하기
-    Eigen::Vector3d start_normal = getFaceNormal(start_point, mesh);
-    Eigen::Vector3d end_normal = getFaceNormal(end_point, mesh);
-    geometry_msgs::msg::Point start_approach;
-    geometry_msgs::msg::Point end_retreat;
-    if (option == 1) // approach
-    {
-
-        start_approach.x = start_point.x + start_normal.x() * 0.1;
-        start_approach.y = start_point.y + start_normal.y() * 0.1;
-        start_approach.z = start_point.z + start_normal.z() * 0.1;
-
-        return {start_approach, start_point};
-    }
-    else if (option == 2) // retreat
-    {
-
-        end_retreat.x = end_point.x + 0.1 * end_normal.x();
-        end_retreat.y = end_point.y + 0.1 * end_normal.y();
-        end_retreat.z = end_point.z + 0.1 * end_normal.z();
-
-        return {end_point, end_retreat};
-    }
-    else if (option == 3) // home
-    {
-        end_retreat.x = end_point.x + 0.1 * end_normal.x();
-        end_retreat.y = end_point.y + 0.1 * end_normal.y();
-        end_retreat.z = end_point.z + 0.1 * end_normal.z();
-        geometry_msgs::msg::Point home;
-        home.x = 0.573;
-        home.y = -0.127;
-        home.z = 0.25;
-        return {end_retreat, home};
-    }
-    return {};
+Eigen::Vector3d toEigen(const geometry_msgs::msg::Point &p)
+{
+    return Eigen::Vector3d(p.x, p.y, p.z);
 }
 
-std::vector<double> nrs_interpolation::computeCumulativeDistances(const std::vector<geometry_msgs::msg::Point> &points)
+geometry_msgs::msg::Point toRosPoint(const Eigen::Vector3d &p)
+{
+    geometry_msgs::msg::Point out;
+    out.x = p.x();
+    out.y = p.y();
+    out.z = p.z();
+    return out;
+}
+
+double quatDot(const tf2::Quaternion &q1, const tf2::Quaternion &q2)
+{
+    return q1.x() * q2.x() + q1.y() * q2.y() + q1.z() * q2.z() + q1.w() * q2.w();
+}
+
+Eigen::Vector3d projectToPlane(const Eigen::Vector3d &v, const Eigen::Vector3d &normal)
+{
+    return v - v.dot(normal) * normal;
+}
+
+Eigen::Vector3d fallbackTangent(const Eigen::Vector3d &z_axis)
+{
+    Eigen::Vector3d ref(1.0, 0.0, 0.0);
+    if (std::abs(z_axis.dot(ref)) > 0.9)
+        ref = Eigen::Vector3d(0.0, 1.0, 0.0);
+
+    Eigen::Vector3d x = projectToPlane(ref, z_axis);
+
+    if (x.norm() < 1e-12)
+    {
+        ref = Eigen::Vector3d(0.0, 0.0, 1.0);
+        x = projectToPlane(ref, z_axis);
+    }
+
+    if (x.norm() < 1e-12)
+        x = Eigen::Vector3d(1.0, 0.0, 0.0);
+
+    return x.normalized();
+}
+
+tf2::Quaternion axesToQuaternion(const Eigen::Vector3d &x_axis,
+                                 const Eigen::Vector3d &y_axis,
+                                 const Eigen::Vector3d &z_axis)
+{
+    tf2::Matrix3x3 R(
+        x_axis.x(), y_axis.x(), z_axis.x(),
+        x_axis.y(), y_axis.y(), z_axis.y(),
+        x_axis.z(), y_axis.z(), z_axis.z());
+
+    tf2::Quaternion q;
+    R.getRotation(q);
+    q.normalize();
+    return q;
+}
+
+geometry_msgs::msg::Point interpolatePointLinear(const geometry_msgs::msg::Point &p0,
+                                                 const geometry_msgs::msg::Point &p1,
+                                                 double t)
+{
+    geometry_msgs::msg::Point out;
+    out.x = p0.x + t * (p1.x - p0.x);
+    out.y = p0.y + t * (p1.y - p0.y);
+    out.z = p0.z + t * (p1.z - p0.z);
+    return out;
+}
+
+Eigen::Vector3d interpolateNormalLinear(const Eigen::Vector3d &n0,
+                                        const Eigen::Vector3d &n1,
+                                        double t)
+{
+    Eigen::Vector3d n = (1.0 - t) * n0 + t * n1;
+    if (n.norm() < 1e-12)
+        return n0;
+    return n.normalized();
+}
+
+Eigen::Vector3d computeLocalTangent(const std::vector<Eigen::Vector3d> &pts, size_t i)
+{
+    if (pts.size() < 2)
+        return Eigen::Vector3d::Zero();
+
+    if (i == 0)
+        return pts[1] - pts[0];
+    else if (i == pts.size() - 1)
+        return pts[i] - pts[i - 1];
+    else
+        return pts[i + 1] - pts[i - 1];
+}
+
+nrs_path2::msg::Waypoints buildWaypointsFromPointsAndNormals(
+    const std::vector<geometry_msgs::msg::Point> &points,
+    const std::vector<Eigen::Vector3d> &normals_in,
+    double fx, double fy, double fz)
+{
+    nrs_path2::msg::Waypoints waypoints;
+    if (points.empty() || points.size() != normals_in.size())
+        return waypoints;
+
+    std::vector<Eigen::Vector3d> pts;
+    pts.reserve(points.size());
+    for (const auto &p : points)
+        pts.push_back(toEigen(p));
+
+    std::vector<Eigen::Vector3d> normals = normals_in;
+    for (size_t i = 0; i < normals.size(); ++i)
+    {
+        if (normals[i].norm() < 1e-12)
+        {
+            if (i > 0)
+                normals[i] = normals[i - 1];
+            else
+                normals[i] = Eigen::Vector3d(0.0, 0.0, 1.0);
+        }
+        else
+        {
+            normals[i].normalize();
+        }
+
+        if (i > 0 && normals[i].dot(normals[i - 1]) < 0.0)
+            normals[i] = -normals[i];
+    }
+
+    Eigen::Vector3d prev_x = fallbackTangent(-normals[0]);
+    tf2::Quaternion prev_q(0.0, 0.0, 0.0, 1.0);
+
+    for (size_t i = 0; i < pts.size(); ++i)
+    {
+        Eigen::Vector3d z_axis = -normals[i];
+        if (z_axis.norm() < 1e-12)
+            z_axis = Eigen::Vector3d(0.0, 0.0, 1.0);
+        z_axis.normalize();
+
+        Eigen::Vector3d local_tangent = computeLocalTangent(pts, i);
+        Eigen::Vector3d tangent_proj = projectToPlane(local_tangent, z_axis);
+
+        if (tangent_proj.norm() > 1e-12)
+            tangent_proj.normalize();
+
+        Eigen::Vector3d x_axis;
+        if (i == 0)
+        {
+            if (tangent_proj.norm() > 1e-12)
+                x_axis = tangent_proj;
+            else
+                x_axis = fallbackTangent(z_axis);
+        }
+        else
+        {
+            x_axis = projectToPlane(prev_x, z_axis);
+
+            if (x_axis.norm() < 1e-12)
+            {
+                if (tangent_proj.norm() > 1e-12)
+                    x_axis = tangent_proj;
+                else
+                    x_axis = fallbackTangent(z_axis);
+            }
+            else
+            {
+                x_axis.normalize();
+            }
+
+            if (tangent_proj.norm() > 1e-12 && x_axis.dot(tangent_proj) < 0.0)
+                x_axis = -x_axis;
+        }
+
+        Eigen::Vector3d y_axis = z_axis.cross(x_axis);
+        if (y_axis.norm() < 1e-12)
+        {
+            x_axis = fallbackTangent(z_axis);
+            y_axis = z_axis.cross(x_axis);
+        }
+
+        y_axis.normalize();
+        x_axis = y_axis.cross(z_axis).normalized();
+
+        tf2::Quaternion q = axesToQuaternion(x_axis, y_axis, z_axis);
+        if (quatDot(q, prev_q) < 0.0)
+            q = tf2::Quaternion(-q.x(), -q.y(), -q.z(), -q.w());
+
+        nrs_path2::msg::Waypoint wp;
+        wp.x = pts[i].x();
+        wp.y = pts[i].y();
+        wp.z = pts[i].z();
+        wp.qw = q.getW();
+        wp.qx = q.getX();
+        wp.qy = q.getY();
+        wp.qz = q.getZ();
+        wp.fx = fx;
+        wp.fy = fy;
+        wp.fz = fz;
+
+        waypoints.waypoints.push_back(wp);
+
+        prev_x = x_axis;
+        prev_q = q;
+    }
+
+    return waypoints;
+}
+} // namespace
+
+std::vector<double> nrs_interpolation::computeCumulativeDistances(
+    const std::vector<geometry_msgs::msg::Point> &points)
 {
     std::vector<double> cumulative_distances(points.size(), 0.0);
+
     for (size_t i = 1; i < points.size(); ++i)
     {
         Eigen::Vector3d p0(points[i - 1].x, points[i - 1].y, points[i - 1].z);
         Eigen::Vector3d p1(points[i].x, points[i].y, points[i].z);
         cumulative_distances[i] = cumulative_distances[i - 1] + (p1 - p0).norm();
     }
+
     return cumulative_distances;
 }
 
-// Option 1: 일정 간격 보간
-std::vector<geometry_msgs::msg::Point> nrs_interpolation::interpolatePoints_Constant(const std::vector<geometry_msgs::msg::Point> &points,
-                                                                                     const std::vector<double> &cumulative_distances,
-                                                                                     double desired_interval)
+Eigen::Vector3d nrs_interpolation::getFaceNormal(
+    const geometry_msgs::msg::Point &ros_point,
+    const Triangle_mesh &mesh)
 {
-    std::vector<geometry_msgs::msg::Point> interpolated_points;
-    double current_distance = 0.0;
-    size_t j = 1;
-    while (j < points.size())
-    {
-    if (cumulative_distances[j] >= current_distance + desired_interval)
-    {
-    double t = (current_distance + desired_interval - cumulative_distances[j - 1]) /
-    (cumulative_distances[j] - cumulative_distances[j - 1]);
+    Point_3 cgal_point(ros_point.x, ros_point.y, ros_point.z);
 
-    geometry_msgs::msg::Point ip;
-    ip.x = points[j - 1].x + t * (points[j].x - points[j - 1].x);
-    ip.y = points[j - 1].y + t * (points[j].y - points[j - 1].y);
-    ip.z = points[j - 1].z + t * (points[j].z - points[j - 1].z);
+    face_descriptor face;
+    CGAL::cpp11::array<double, 3> location;
 
-    interpolated_points.push_back(ip);
-    current_distance += desired_interval;
-    }
-    else
+    if (!n_geodesic.locate_face_and_point(cgal_point, face, location, mesh))
     {
-    ++j;
+        RCLCPP_ERROR(rclcpp::get_logger("nrs_interpolation"),
+                     "Failed to locate face and point for point: [%f, %f, %f]",
+                     ros_point.x, ros_point.y, ros_point.z);
+        return Eigen::Vector3d::Zero();
     }
-    }
-    return interpolated_points;
+
+    Triangle_mesh::Halfedge_index h = mesh.halfedge(face);
+    vertex_descriptor v0 = mesh.source(h);
+    vertex_descriptor v1 = mesh.target(h);
+    vertex_descriptor v2 = mesh.target(mesh.next(h));
+
+    Kernel::Vector_3 normal_v0 = CGAL::Polygon_mesh_processing::compute_vertex_normal(v0, mesh);
+    Kernel::Vector_3 normal_v1 = CGAL::Polygon_mesh_processing::compute_vertex_normal(v1, mesh);
+    Kernel::Vector_3 normal_v2 = CGAL::Polygon_mesh_processing::compute_vertex_normal(v2, mesh);
+
+    Eigen::Vector3d n0(normal_v0.x(), normal_v0.y(), normal_v0.z());
+    Eigen::Vector3d n1(normal_v1.x(), normal_v1.y(), normal_v1.z());
+    Eigen::Vector3d n2(normal_v2.x(), normal_v2.y(), normal_v2.z());
+
+    Eigen::Vector3d normal =
+        location[0] * n0 +
+        location[1] * n1 +
+        location[2] * n2;
+
+    if (normal.norm() < 1e-12)
+        return Eigen::Vector3d::Zero();
+
+    return normal.normalized();
 }
 
-// Option 2: 가변 간격 보간
-std::vector<geometry_msgs::msg::Point> nrs_interpolation::interpolatePoints_Variable(const std::vector<geometry_msgs::msg::Point> &points,
-                                                                                     const std::vector<double> &cumulative_distances,
-                                                                                     double desired_interval)
-{
-    std::vector<geometry_msgs::msg::Point> interpolated_points;
-    double total_distance = cumulative_distances.back();
-    double transition_length = 0.03; // 3cm
-
-    auto computeVariableInterval = [&](double current_distance) -> double
-    {
-        if (current_distance < transition_length) // 초반 3cm 구간
-        {
-            double scale = 0.5 * (1 - cos((current_distance / transition_length) * M_PI));
-            return desired_interval / 6.0 + scale * (desired_interval - desired_interval / 6.0);
-        }
-        else if (current_distance > total_distance - transition_length) // 끝부분 3cm 구간
-        {
-            double remaining_distance = total_distance - current_distance;
-            double scale = 0.5 * (1 - cos((remaining_distance / transition_length) * M_PI));
-            return desired_interval / 6.0 + scale * (desired_interval - desired_interval / 6.0);
-        }
-        else // 중간 구간은 일정 간격 유지
-        {
-            return desired_interval;
-        }
-    };
-
-    double current_distance = 0.0;
-    size_t j = 1;
-    while (j < points.size())
-    {
-        double current_interval = computeVariableInterval(current_distance);
-
-        if (cumulative_distances[j] >= current_distance + current_interval)
-        {
-            double t = (current_distance + current_interval - cumulative_distances[j - 1]) /
-                       (cumulative_distances[j] - cumulative_distances[j - 1]);
-
-            geometry_msgs::msg::Point ip;
-            ip.x = points[j - 1].x + t * (points[j].x - points[j - 1].x);
-            ip.y = points[j - 1].y + t * (points[j].y - points[j - 1].y);
-            ip.z = points[j - 1].z + t * (points[j].z - points[j - 1].z);
-
-            interpolated_points.push_back(ip);
-            current_distance += current_interval;
-        }
-        else
-        {
-            ++j;
-        }
-    }
-    return interpolated_points;
-}
-
-std::vector<geometry_msgs::msg::Point> nrs_interpolation::interpolatePoints(
-    const std::vector<geometry_msgs::msg::Point> &points,
-    double desired_interval,
-    int option)
-{
-    // 누적 거리 계산
-    std::vector<double> cumulative_distances = computeCumulativeDistances(points);
-
-    if (option == 1)
-    {
-        return interpolatePoints_Constant(points, cumulative_distances, desired_interval);
-    }
-    else if (option == 2)
-    {
-        return interpolatePoints_Variable(points, cumulative_distances, desired_interval);
-    }
-    else
-    {
-        return std::vector<geometry_msgs::msg::Point>(); // 잘못된 옵션의 경우 빈 벡터 반환
-    }
-}
-
-// 옵션 1: Approach Segment
-// 시작점의 노멀(start_normal)을 기준으로 동일 orientation 적용
-nrs_path2::msg::Waypoints nrs_interpolation::setToolVectorApproach(
-    const std::vector<geometry_msgs::msg::Point> &points,
-    const Triangle_mesh &mesh,
-    const Kernel::Vector_3 &start_normal)
-{
-    nrs_path2::msg::Waypoints waypoints;
-    tf2::Vector3 z_axis(-start_normal.x(), -start_normal.y(), -start_normal.z());
-    z_axis.normalize();
-    tf2::Vector3 x_axis(-1.0, -1.0, 0.0);
-    tf2::Vector3 y_axis = z_axis.cross(x_axis.normalized());
-    x_axis = y_axis.cross(z_axis).normalized();
-    tf2::Matrix3x3 orientation_matrix(
-        x_axis.x(), y_axis.x(), z_axis.x(),
-        x_axis.y(), y_axis.y(), z_axis.y(),
-        x_axis.z(), y_axis.z(), z_axis.z());
-    tf2::Quaternion q;
-    orientation_matrix.getRotation(q);
-
-    for (const auto &point : points)
-    {
-        nrs_path2::msg::Waypoint wp;
-        wp.x = point.x;
-        wp.y = point.y;
-        wp.z = point.z;
-        wp.qw = q.getW();
-        wp.qx = q.getX();
-        wp.qy = q.getY();
-        wp.qz = q.getZ();
-        waypoints.waypoints.push_back(wp);
-    }
-    return waypoints;
-}
-
-//--------------------------------------------------------
-// 옵션 2: Original Segment
-// 각 점마다 해당 점이 속한 face를 찾아, 바리센트릭 좌표를 이용해 보간된 노멀로 orientation 계산
 nrs_path2::msg::Waypoints nrs_interpolation::setToolVectorOriginal(
     const std::vector<geometry_msgs::msg::Point> &points,
     const Triangle_mesh &mesh,
-    double fx, double fy, double fz
-    //// double Fx, double Fy, double Fz
-    )
+    double fx, double fy, double fz)
 {
-    nrs_path2::msg::Waypoints waypoints;
-    for (const auto &point : points)
+    if (points.empty())
+        return nrs_path2::msg::Waypoints();
+
+    std::vector<Eigen::Vector3d> normals;
+    normals.reserve(points.size());
+
+    for (size_t i = 0; i < points.size(); ++i)
     {
-        Point_3 cgal_point(point.x, point.y, point.z);
-        face_descriptor face;
-        CGAL::cpp11::array<double, 3> location;
-        if (!n_geodesic.locate_face_and_point(cgal_point, face, location, mesh))
+        Eigen::Vector3d n = getFaceNormal(points[i], mesh);
+
+        if (n.norm() < 1e-12)
         {
-            RCLCPP_ERROR(rclcpp::get_logger("nrs_interpolation"), "Failed to locate face for point: [%f, %f, %f]", point.x, point.y, point.z);
-            //// ROS_ERROR("Failed to locate face for point: [%f, %f, %f]", point.x, point.y, point.z);
-            continue;
+            if (!normals.empty())
+                n = normals.back();
+            else
+                n = Eigen::Vector3d(0.0, 0.0, 1.0);
         }
 
-        // face의 세 정점을 가져와서 노멀 계산
-        Triangle_mesh::Halfedge_index h = mesh.halfedge(face);
-        vertex_descriptor v0 = mesh.source(h);
-        vertex_descriptor v1 = mesh.target(h);
-        vertex_descriptor v2 = mesh.target(mesh.next(h));
-        Kernel::Vector_3 normal_v0 = CGAL::Polygon_mesh_processing::compute_vertex_normal(v0, mesh);
-        Kernel::Vector_3 normal_v1 = CGAL::Polygon_mesh_processing::compute_vertex_normal(v1, mesh);
-        Kernel::Vector_3 normal_v2 = CGAL::Polygon_mesh_processing::compute_vertex_normal(v2, mesh);
-        Kernel::Vector_3 interpolated_normal = location[0] * normal_v0 +
-                                               location[1] * normal_v1 +
-                                               location[2] * normal_v2;
-        tf2::Vector3 z_axis(-interpolated_normal.x(), -interpolated_normal.y(), -interpolated_normal.z());
-        z_axis.normalize();
-        tf2::Vector3 x_axis(-1.0, -1.0, 0.0);
-        tf2::Vector3 y_axis = z_axis.cross(x_axis.normalized());
-        x_axis = y_axis.cross(z_axis).normalized();
-        tf2::Matrix3x3 orientation_matrix(
-            x_axis.x(), y_axis.x(), z_axis.x(),
-            x_axis.y(), y_axis.y(), z_axis.y(),
-            x_axis.z(), y_axis.z(), z_axis.z());
-        tf2::Quaternion q;
-        orientation_matrix.getRotation(q);
+        if (!normals.empty() && n.dot(normals.back()) < 0.0)
+            n = -n;
 
-        nrs_path2::msg::Waypoint wp;
-        wp.x = point.x;
-        wp.y = point.y;
-        wp.z = point.z;
-        wp.qw = q.getW();
-        wp.qx = q.getX();
-        wp.qy = q.getY();
-        wp.qz = q.getZ();
-        wp.fx = fx; ////wp.Fx = Fx;
-        wp.fy = fy; ////wp.Fy = Fy;
-        wp.fz = fz; ////wp.Fz = Fz;
-        waypoints.waypoints.push_back(wp);
+        normals.push_back(n.normalized());
     }
-    return waypoints;
-}
 
-//--------------------------------------------------------
-// 옵션 3: Retreat Segment
-// 마지막 reference point의 노멀(end_normal)을 기준으로 동일 orientation 적용
-nrs_path2::msg::Waypoints nrs_interpolation::setToolVectorRetreat(
-    const std::vector<geometry_msgs::msg::Point> &points,
-    const Triangle_mesh &mesh,
-    const Kernel::Vector_3 &end_normal)
-{
-    nrs_path2::msg::Waypoints waypoints;
-    tf2::Vector3 z_axis(-end_normal.x(), -end_normal.y(), -end_normal.z());
-    z_axis.normalize();
-    tf2::Vector3 x_axis(-1.0, -1.0, 0.0);
-    tf2::Vector3 y_axis = z_axis.cross(x_axis.normalized());
-    x_axis = y_axis.cross(z_axis).normalized();
-    tf2::Matrix3x3 orientation_matrix(
-        x_axis.x(), y_axis.x(), z_axis.x(),
-        x_axis.y(), y_axis.y(), z_axis.y(),
-        x_axis.z(), y_axis.z(), z_axis.z());
-    tf2::Quaternion q;
-    orientation_matrix.getRotation(q);
-
-    for (const auto &point : points)
-    {
-        nrs_path2::msg::Waypoint wp;
-        wp.x = point.x;
-        wp.y = point.y;
-        wp.z = point.z;
-        wp.qw = q.getW();
-        wp.qx = q.getX();
-        wp.qy = q.getY();
-        wp.qz = q.getZ();
-        waypoints.waypoints.push_back(wp);
-    }
-    return waypoints;
-}
-
-//--------------------------------------------------------
-// 옵션 4: Home Segment
-// 마지막 reference point의 노멀(end_normal)을 기준으로 계산한 orientation으로 전체 구간에 동일 적용
-nrs_path2::msg::Waypoints nrs_interpolation::setToolVectorHome(
-    const std::vector<geometry_msgs::msg::Point> &points,
-    const Triangle_mesh &mesh,
-    const Kernel::Vector_3 &end_normal)
-{
-    nrs_path2::msg::Waypoints waypoints;
-    tf2::Vector3 z_axis(-end_normal.x(), -end_normal.y(), -end_normal.z());
-    z_axis.normalize();
-    tf2::Vector3 x_axis(-1.0, -1.0, 0.0);
-    tf2::Vector3 y_axis = z_axis.cross(x_axis.normalized());
-    x_axis = y_axis.cross(z_axis).normalized();
-    tf2::Matrix3x3 orientation_matrix(
-        x_axis.x(), y_axis.x(), z_axis.x(),
-        x_axis.y(), y_axis.y(), z_axis.y(),
-        x_axis.z(), y_axis.z(), z_axis.z());
-    tf2::Quaternion q;
-    orientation_matrix.getRotation(q);
-
-    for (const auto &point : points)
-    {
-        nrs_path2::msg::Waypoint wp;
-        wp.x = point.x;
-        wp.y = point.y;
-        wp.z = point.z;
-        wp.qw = q.getW();
-        wp.qx = q.getX();
-        wp.qy = q.getY();
-        wp.qz = q.getZ();
-        waypoints.waypoints.push_back(wp);
-    }
-    return waypoints;
-}
-
-//--------------------------------------------------------
-// 옵션 5: 각 점마다 개별 orientation 계산
-nrs_path2::msg::Waypoints nrs_interpolation::setToolVectorOriginalIncludeVectorSmoothing(
-    const std::vector<geometry_msgs::msg::Point> &points,
-    const Triangle_mesh &mesh,
-    double fx, double fy, double fz
-    //// double Fx, double Fy, double Fz
-    )
-{
-    nrs_path2::msg::Waypoints waypoints;
-    for (const auto &point : points)
-    {
-        Point_3 cgal_point(point.x, point.y, point.z);
-        face_descriptor face;
-        CGAL::cpp11::array<double, 3> location;
-        if (!n_geodesic.locate_face_and_point(cgal_point, face, location, mesh))
-        {
-            RCLCPP_ERROR(rclcpp::get_logger("nrs_interpolation"), "Failed to locate face for point: [%f, %f, %f]", point.x, point.y, point.z);
-            //// ROS_ERROR("Failed to locate face for point: [%f, %f, %f]", point.x, point.y, point.z);
-            continue;
-        }
-        tf2::Vector3 z_axis;
-        {
-            // face의 세 정점을 사용하여 보간된 노멀 계산
-            Triangle_mesh::Halfedge_index h = mesh.halfedge(face);
-            vertex_descriptor v0 = mesh.source(h);
-            vertex_descriptor v1 = mesh.target(h);
-            vertex_descriptor v2 = mesh.target(mesh.next(h));
-            Kernel::Vector_3 normal_v0 = CGAL::Polygon_mesh_processing::compute_vertex_normal(v0, mesh);
-            Kernel::Vector_3 normal_v1 = CGAL::Polygon_mesh_processing::compute_vertex_normal(v1, mesh);
-            Kernel::Vector_3 normal_v2 = CGAL::Polygon_mesh_processing::compute_vertex_normal(v2, mesh);
-            Kernel::Vector_3 interpolated_normal = location[0] * normal_v0 +
-                                                   location[1] * normal_v1 +
-                                                   location[2] * normal_v2;
-            z_axis = tf2::Vector3(-interpolated_normal.x(), -interpolated_normal.y(), -interpolated_normal.z());
-            z_axis.normalize();
-        }
-        tf2::Vector3 x_axis(-1.0, -1.0, 0.0);
-        tf2::Vector3 y_axis = z_axis.cross(x_axis.normalized());
-        x_axis = y_axis.cross(z_axis).normalized();
-        tf2::Matrix3x3 orientation_matrix(
-            x_axis.x(), y_axis.x(), z_axis.x(),
-            x_axis.y(), y_axis.y(), z_axis.y(),
-            x_axis.z(), y_axis.z(), z_axis.z());
-        tf2::Quaternion q;
-        orientation_matrix.getRotation(q);
-
-        nrs_path2::msg::Waypoint wp;
-        wp.x = point.x;
-        wp.y = point.y;
-        wp.z = point.z;
-        wp.qw = q.getW();
-        wp.qx = q.getX();
-        wp.qy = q.getY();
-        wp.qz = q.getZ();
-        wp.fx = fx; //// wp.Fx = Fx;
-        wp.fy = fy; //// wp.Fy = Fy;
-        wp.fz = fz; //// wp.Fz = Fz;
-        waypoints.waypoints.push_back(wp);
-    }
-    return waypoints;
-}
-
-//--------------------------------------------------------
-// 최종 wrapper 함수: reference_points로부터 시작/끝 노멀 계산 후 옵션에 따라 헬퍼 호출
-nrs_path2::msg::Waypoints nrs_interpolation::setToolVector(const std::vector<geometry_msgs::msg::Point> &approach_interpolated,
-                                                           const std::vector<geometry_msgs::msg::Point> &original_interpolated,
-                                                           const std::vector<geometry_msgs::msg::Point> &retreat_interpolated,
-                                                           const std::vector<geometry_msgs::msg::Point> &home_interpolated,
-                                                           const Triangle_mesh &mesh,
-                                                           double fx, double fy, double fz
-                                                           //// double Fx, double Fy, double Fz
-                                                           )
-{
-    // reference_points에서 시작점과 끝점을 결정
-    Point_3 start_point(original_interpolated.front().x, original_interpolated.front().y, original_interpolated.front().z);
-    Point_3 end_point(original_interpolated.back().x, original_interpolated.back().y, original_interpolated.back().z);
-    face_descriptor start_face, end_face;
-    CGAL::cpp11::array<double, 3> start_location, end_location;
-    n_geodesic.locate_face_and_point(start_point, start_face, start_location, mesh);
-    n_geodesic.locate_face_and_point(end_point, end_face, end_location, mesh);
-    Kernel::Vector_3 start_normal = CGAL::Polygon_mesh_processing::compute_face_normal(start_face, mesh);
-    Kernel::Vector_3 end_normal = CGAL::Polygon_mesh_processing::compute_face_normal(end_face, mesh);
-
-    nrs_path2::msg::Waypoints approach_waypoints = setToolVectorApproach(approach_interpolated, mesh, start_normal);
-    nrs_path2::msg::Waypoints original_waypoints = setToolVectorOriginal(original_interpolated, mesh, fx, fy, fz);
-    //// nrs_path::Waypoints original_waypoints = setToolVectorOriginal(original_interpolated, mesh, Fx, Fy, Fz);
-    nrs_path2::msg::Waypoints retreat_waypoints = setToolVectorRetreat(retreat_interpolated, mesh, end_normal);
-    nrs_path2::msg::Waypoints home_waypoints = setToolVectorHome(home_interpolated, mesh, end_normal);
-
-    nrs_path2::msg::Waypoints final_waypoints;
-    final_waypoints.waypoints.insert(final_waypoints.waypoints.end(),
-                                     approach_waypoints.waypoints.begin(), approach_waypoints.waypoints.end());
-    final_waypoints.waypoints.insert(final_waypoints.waypoints.end(),
-                                     original_waypoints.waypoints.begin(), original_waypoints.waypoints.end());
-    final_waypoints.waypoints.insert(final_waypoints.waypoints.end(),
-                                     retreat_waypoints.waypoints.begin(), retreat_waypoints.waypoints.end());
-    final_waypoints.waypoints.insert(final_waypoints.waypoints.end(),
-                                     home_waypoints.waypoints.begin(), home_waypoints.waypoints.end());
-    return final_waypoints;
-}
-
-// SLERP 헬퍼 함수 구현
-tf2::Quaternion nrs_interpolation::quaternionSlerp(const tf2::Quaternion &q1, const tf2::Quaternion &q2, double t)
-{
-    double dot = q1.x() * q2.x() + q1.y() * q2.y() + q1.z() * q2.z() + q1.w() * q2.w();
-    tf2::Quaternion q2_copy = q2;
-    if (dot < 0.0)
-    {
-        q2_copy = q2_copy.inverse();  // 반전된 q2_copy 생성
-        //// q2_copy = -q2_copy;
-        dot = -dot;
-    }
-    if (dot > 0.9995)
-    {
-        tf2::Quaternion result = q1 * (1.0 - t) + q2_copy * t;
-        result.normalize();
-        return result;
-    }
-    double theta_0 = acos(dot);
-    double theta = theta_0 * t;
-    double sin_theta = sin(theta);
-    double sin_theta_0 = sin(theta_0);
-    double s1 = cos(theta) - dot * sin_theta / sin_theta_0;
-    double s2 = sin_theta / sin_theta_0;
-    tf2::Quaternion result = (q1 * s1) + (q2_copy * s2);
-    result.normalize();
-    return result;
-}
-
-// 쿼터니언 기반 보간 함수 구현
-nrs_path2::msg::Waypoints nrs_interpolation::interpolateXYZQF(const nrs_path2::msg::Waypoints &input, double desired_interval)
-{
-    nrs_path2::msg::Waypoints output;
-    if (input.waypoints.empty())
-        return output;
-
-    std::vector<double> cumulative_distances;
-    cumulative_distances.push_back(0.0);
-    for (size_t i = 1; i < input.waypoints.size(); i++)
-    {
-        const auto &p0 = input.waypoints[i - 1];
-        const auto &p1 = input.waypoints[i];
-        double dx = p1.x - p0.x;
-        double dy = p1.y - p0.y;
-        double dz = p1.z - p0.z;
-        double segment_distance = std::sqrt(dx * dx + dy * dy + dz * dz);
-        cumulative_distances.push_back(cumulative_distances.back() + segment_distance);
-    }
-    double total_distance = cumulative_distances.back();
-    for (double d = 0.0; d <= total_distance; d += desired_interval)
-    {
-        size_t i = 1;
-        while (i < cumulative_distances.size() && cumulative_distances[i] < d)
-            i++;
-        double t = (d - cumulative_distances[i - 1]) / (cumulative_distances[i] - cumulative_distances[i - 1]);
-        const auto &p0 = input.waypoints[i - 1];
-        const auto &p1 = input.waypoints[i];
-        nrs_path2::msg::Waypoint interp_wp;
-        interp_wp.x = p0.x + t * (p1.x - p0.x);
-        interp_wp.y = p0.y + t * (p1.y - p0.y);
-        interp_wp.z = p0.z + t * (p1.z - p0.z);
-        tf2::Quaternion q0(p0.qx, p0.qy, p0.qz, p0.qw);
-        tf2::Quaternion q1(p1.qx, p1.qy, p1.qz, p1.qw);
-        tf2::Quaternion q_interp = quaternionSlerp(q0, q1, t);
-        interp_wp.qw = q_interp.getW();
-        interp_wp.qx = q_interp.getX();
-        interp_wp.qy = q_interp.getY();
-        interp_wp.qz = q_interp.getZ();
-        interp_wp.fx = p0.fx + t * (p1.fx - p0.fx); //// interp_wp.Fx = p0.Fx + t * (p1.Fx - p0.Fx);
-        interp_wp.fy = p0.fy + t * (p1.fy - p0.fy); //// interp_wp.Fy = p0.Fy + t * (p1.Fy - p0.Fy);
-        interp_wp.fz = p0.fz + t * (p1.fz - p0.fz); //// interp_wp.Fz = p0.Fz + t * (p1.Fz - p0.Fz);
-
-        output.waypoints.push_back(interp_wp);
-    }
-    return output;
+    return buildWaypointsFromPointsAndNormals(points, normals, fx, fy, fz);
 }
 
 nrs_path2::msg::Waypoints nrs_interpolation::interpolateEnd2End(
     const nrs_path2::msg::Waypoints &original_waypoints,
     double desired_interval,
     const Triangle_mesh &mesh,
-    double fx, double fy, double fz
-)
+    double fx, double fy, double fz)
 {
+    nrs_path2::msg::Waypoints output;
+
+    if (original_waypoints.waypoints.size() < 2)
+    {
+        RCLCPP_WARN(rclcpp::get_logger("nrs_interpolation"),
+                    "original_waypoints size is less than 2. Returning empty waypoints.");
+        return output;
+    }
+
+    if (desired_interval <= 0.0)
+        desired_interval = 0.001;
+
     std::vector<geometry_msgs::msg::Point> original_points;
+    original_points.reserve(original_waypoints.waypoints.size());
+
     for (const auto &wp : original_waypoints.waypoints)
     {
         geometry_msgs::msg::Point pt;
         pt.x = wp.x;
         pt.y = wp.y;
         pt.z = wp.z;
+
+        if (!original_points.empty())
+        {
+            Eigen::Vector3d prev = toEigen(original_points.back());
+            Eigen::Vector3d cur = toEigen(pt);
+            if ((cur - prev).norm() < 1e-12)
+                continue;
+        }
+
         original_points.push_back(pt);
     }
 
-    // 예외 처리
     if (original_points.size() < 2)
     {
         RCLCPP_WARN(rclcpp::get_logger("nrs_interpolation"),
-                    "original_points size is less than 2. Returning empty waypoints.");
-        return nrs_path2::msg::Waypoints();
+                    "Filtered original_points size is less than 2. Returning empty waypoints.");
+        return output;
     }
 
-    // surface 위 original path만 보간
-    std::vector<geometry_msgs::msg::Point> original_interpolated =
-        interpolatePoints(original_points, 0.001, 2);
+    std::vector<Eigen::Vector3d> original_normals;
+    original_normals.reserve(original_points.size());
 
-    // mesh normal을 반영하여 orientation + force 부여
-    nrs_path2::msg::Waypoints waypointsXYZQ =
-        setToolVectorOriginal(original_interpolated, mesh, fx, fy, fz);
-
-    // 최종 desired_interval로 xyz + quaternion + force 재보간
-    nrs_path2::msg::Waypoints waypointsXYZQF =
-        interpolateXYZQF(waypointsXYZQ, desired_interval);
-
-    return waypointsXYZQF;
-}
-
-Eigen::Vector3d nrs_interpolation::getFaceNormal(const geometry_msgs::msg::Point &ros_point, const Triangle_mesh &mesh)
-{
-    // ROS geometry_msgs::Point -> CGAL Point_3 변환
-    Point_3 cgal_point(ros_point.x, ros_point.y, ros_point.z);
-
-    // locate_face_and_point()를 사용하여 서피스에서 점과 면을 찾음
-    face_descriptor face;
-    CGAL::cpp11::array<double, 3> location; // Barycentric coordinates
-
-    if (!n_geodesic.locate_face_and_point(cgal_point, face, location, mesh))
+    for (size_t i = 0; i < original_points.size(); ++i)
     {
-        RCLCPP_ERROR(rclcpp::get_logger("nrs_interpolation"), "Failed to locate face and point for point: [%f, %f, %f]", ros_point.x, ros_point.y, ros_point.z);
-        //// ROS_ERROR("Failed to locate face and point for point: [%f, %f, %f]", ros_point.x, ros_point.y, ros_point.z);
-        return Eigen::Vector3d::Zero(); // 실패 시 0 벡터 반환
+        Eigen::Vector3d n = getFaceNormal(original_points[i], mesh);
+
+        if (n.norm() < 1e-12)
+        {
+            if (!original_normals.empty())
+                n = original_normals.back();
+            else
+                n = Eigen::Vector3d(0.0, 0.0, 1.0);
+        }
+
+        if (!original_normals.empty() && n.dot(original_normals.back()) < 0.0)
+            n = -n;
+
+        original_normals.push_back(n.normalized());
     }
 
-    // 면의 노멀 벡터 계산
-    Kernel::Vector_3 normal = CGAL::Polygon_mesh_processing::compute_face_normal(face, mesh);
+    std::vector<double> cumulative_distances = computeCumulativeDistances(original_points);
+    double total_distance = cumulative_distances.back();
 
-    // CGAL 노멀 벡터를 Eigen::Vector3d로 변환
-    Eigen::Vector3d eigen_normal(normal.x(), normal.y(), normal.z());
+    if (total_distance < 1e-12)
+    {
+        return buildWaypointsFromPointsAndNormals(original_points, original_normals, fx, fy, fz);
+    }
 
-    // 노멀 벡터 정규화
-    eigen_normal.normalize();
+    std::vector<geometry_msgs::msg::Point> resampled_points;
+    std::vector<Eigen::Vector3d> resampled_normals;
 
-    return eigen_normal; // 노멀 벡터 반환
+    resampled_points.reserve(static_cast<size_t>(std::ceil(total_distance / desired_interval)) + 2);
+    resampled_normals.reserve(static_cast<size_t>(std::ceil(total_distance / desired_interval)) + 2);
+
+    Eigen::Vector3d prev_resampled_normal = original_normals.front();
+
+    for (double d = 0.0; d <= total_distance; d += desired_interval)
+    {
+        size_t i = 1;
+        while (i < cumulative_distances.size() && cumulative_distances[i] < d)
+            ++i;
+
+        if (i >= cumulative_distances.size())
+            i = cumulative_distances.size() - 1;
+
+        double seg_len = cumulative_distances[i] - cumulative_distances[i - 1];
+        double t = 0.0;
+        if (seg_len > 1e-12)
+            t = (d - cumulative_distances[i - 1]) / seg_len;
+
+        geometry_msgs::msg::Point p =
+            interpolatePointLinear(original_points[i - 1], original_points[i], t);
+
+        Eigen::Vector3d n =
+            interpolateNormalLinear(original_normals[i - 1], original_normals[i], t);
+
+        if (n.dot(prev_resampled_normal) < 0.0)
+            n = -n;
+
+        if (!resampled_points.empty())
+        {
+            Eigen::Vector3d prev = toEigen(resampled_points.back());
+            Eigen::Vector3d cur = toEigen(p);
+            if ((cur - prev).norm() < 1e-12)
+                continue;
+        }
+
+        resampled_points.push_back(p);
+        resampled_normals.push_back(n.normalized());
+        prev_resampled_normal = n.normalized();
+    }
+
+    if ((toEigen(resampled_points.back()) - toEigen(original_points.back())).norm() > 1e-12)
+    {
+        resampled_points.push_back(original_points.back());
+        Eigen::Vector3d n_last = original_normals.back();
+        if (n_last.dot(prev_resampled_normal) < 0.0)
+            n_last = -n_last;
+        resampled_normals.push_back(n_last.normalized());
+    }
+
+    output = buildWaypointsFromPointsAndNormals(resampled_points, resampled_normals, fx, fy, fz);
+    return output;
 }
