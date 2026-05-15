@@ -537,7 +537,7 @@ private:
     Kernel::Vector_3 end_normal   = CGAL::Polygon_mesh_processing::compute_face_normal(end_face,   mesh);
 
     auto pack_with_fixed_normal = [&](const std::vector<Point>& pts, const Kernel::Vector_3& n){
-      tf2::Vector3 z_axis(-n.x(), -n.y(), -n.z()); z_axis.normalize();
+      tf2::Vector3 z_axis(n.x(), n.y(), n.z()); z_axis.normalize();
       tf2::Vector3 x_axis(-1.0, -1.0, 0.0);
       tf2::Vector3 y_axis = z_axis.cross(x_axis.normalized());
       x_axis = y_axis.cross(z_axis).normalized();
@@ -581,7 +581,7 @@ private:
         Kernel::Vector_3 n2 = CGAL::Polygon_mesh_processing::compute_vertex_normal(v2, mesh);
         Kernel::Vector_3 n = loc[0]*n0 + loc[1]*n1 + loc[2]*n2;
 
-        tf2::Vector3 z_axis(-n.x(), -n.y(), -n.z()); z_axis.normalize();
+        tf2::Vector3 z_axis(n.x(), n.y(), n.z()); z_axis.normalize();
         tf2::Vector3 x_axis(-1.0, -1.0, 0.0);
         tf2::Vector3 y_axis = z_axis.cross(x_axis.normalized());
         x_axis = y_axis.cross(z_axis).normalized();

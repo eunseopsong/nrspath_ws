@@ -5,6 +5,7 @@
 #include <tf2/LinearMath/Matrix3x3.h>
 
 #include <Eigen/Core>
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -15,15 +16,6 @@ Eigen::Vector3d toEigen(const geometry_msgs::msg::Point &p)
     return Eigen::Vector3d(p.x, p.y, p.z);
 }
 
-geometry_msgs::msg::Point toRosPoint(const Eigen::Vector3d &p)
-{
-    geometry_msgs::msg::Point out;
-    out.x = p.x();
-    out.y = p.y();
-    out.z = p.z();
-    return out;
-}
-
 double quatDot(const tf2::Quaternion &q1, const tf2::Quaternion &q2)
 {
     return q1.x() * q2.x() + q1.y() * q2.y() + q1.z() * q2.z() + q1.w() * q2.w();
@@ -32,26 +24,6 @@ double quatDot(const tf2::Quaternion &q1, const tf2::Quaternion &q2)
 Eigen::Vector3d projectToPlane(const Eigen::Vector3d &v, const Eigen::Vector3d &normal)
 {
     return v - v.dot(normal) * normal;
-}
-
-Eigen::Vector3d fallbackTangent(const Eigen::Vector3d &z_axis)
-{
-    Eigen::Vector3d ref(1.0, 0.0, 0.0);
-    if (std::abs(z_axis.dot(ref)) > 0.9)
-        ref = Eigen::Vector3d(0.0, 1.0, 0.0);
-
-    Eigen::Vector3d x = projectToPlane(ref, z_axis);
-
-    if (x.norm() < 1e-12)
-    {
-        ref = Eigen::Vector3d(0.0, 0.0, 1.0);
-        x = projectToPlane(ref, z_axis);
-    }
-
-    if (x.norm() < 1e-12)
-        x = Eigen::Vector3d(1.0, 0.0, 0.0);
-
-    return x.normalized();
 }
 
 tf2::Quaternion axesToQuaternion(const Eigen::Vector3d &x_axis,
@@ -80,13 +52,46 @@ geometry_msgs::msg::Point interpolatePointLinear(const geometry_msgs::msg::Point
     return out;
 }
 
-Eigen::Vector3d interpolateNormalLinear(const Eigen::Vector3d &n0,
-                                        const Eigen::Vector3d &n1,
-                                        double t)
+Eigen::Vector3d interpolateNormalSlerp(const Eigen::Vector3d &n0,
+                                       const Eigen::Vector3d &n1,
+                                       double t)
 {
-    Eigen::Vector3d n = (1.0 - t) * n0 + t * n1;
+    if (n0.norm() < 1e-12)
+        return n1.normalized();
+    if (n1.norm() < 1e-12)
+        return n0.normalized();
+
+    Eigen::Vector3d a = n0.normalized();
+    Eigen::Vector3d b = n1.normalized();
+
+    double dot = a.dot(b);
+    if (dot < 0.0)
+    {
+        b = -b;
+        dot = -dot;
+    }
+
+    dot = std::max(-1.0, std::min(1.0, dot));
+
+    if (dot > 0.9995)
+    {
+        Eigen::Vector3d n = (1.0 - t) * a + t * b;
+        if (n.norm() < 1e-12)
+            return a;
+        return n.normalized();
+    }
+
+    const double theta = std::acos(dot);
+    const double sin_theta = std::sin(theta);
+    if (std::abs(sin_theta) < 1e-12)
+        return a;
+
+    Eigen::Vector3d n =
+        (std::sin((1.0 - t) * theta) / sin_theta) * a +
+        (std::sin(t * theta) / sin_theta) * b;
+
     if (n.norm() < 1e-12)
-        return n0;
+        return a;
     return n.normalized();
 }
 
@@ -101,6 +106,37 @@ Eigen::Vector3d computeLocalTangent(const std::vector<Eigen::Vector3d> &pts, siz
         return pts[i] - pts[i - 1];
     else
         return pts[i + 1] - pts[i - 1];
+}
+
+Eigen::Vector3d makeReferenceXAxis(const Eigen::Vector3d &z_axis,
+                                   const Eigen::Vector3d &tangent_hint,
+                                   const Eigen::Vector3d &prev_x,
+                                   bool has_prev)
+{
+    const Eigen::Vector3d ref_primary(-1.0, -1.0, 0.0);
+    const Eigen::Vector3d ref_secondary(1.0, -1.0, 0.0);
+    const Eigen::Vector3d ref_third(0.0, 0.0, 1.0);
+
+    Eigen::Vector3d x_axis = projectToPlane(ref_primary, z_axis);
+
+    if (x_axis.norm() < 1e-12)
+        x_axis = projectToPlane(ref_secondary, z_axis);
+
+    if (x_axis.norm() < 1e-12)
+        x_axis = projectToPlane(ref_third, z_axis);
+
+    if (x_axis.norm() < 1e-12)
+        x_axis = Eigen::Vector3d(1.0, 0.0, 0.0);
+
+    x_axis.normalize();
+
+    if (tangent_hint.norm() > 1e-12 && x_axis.dot(tangent_hint) < 0.0)
+        x_axis = -x_axis;
+
+    if (has_prev && x_axis.dot(prev_x) < 0.0)
+        x_axis = -x_axis;
+
+    return x_axis.normalized();
 }
 
 nrs_path2::msg::Waypoints buildWaypointsFromPointsAndNormals(
@@ -136,54 +172,37 @@ nrs_path2::msg::Waypoints buildWaypointsFromPointsAndNormals(
             normals[i] = -normals[i];
     }
 
-    Eigen::Vector3d prev_x = fallbackTangent(-normals[0]);
+    Eigen::Vector3d prev_x = Eigen::Vector3d::Zero();
     tf2::Quaternion prev_q(0.0, 0.0, 0.0, 1.0);
+    bool has_prev_x = false;
 
     for (size_t i = 0; i < pts.size(); ++i)
     {
-        Eigen::Vector3d z_axis = -normals[i];
+        Eigen::Vector3d z_axis = normals[i];
         if (z_axis.norm() < 1e-12)
             z_axis = Eigen::Vector3d(0.0, 0.0, 1.0);
         z_axis.normalize();
 
         Eigen::Vector3d local_tangent = computeLocalTangent(pts, i);
         Eigen::Vector3d tangent_proj = projectToPlane(local_tangent, z_axis);
-
         if (tangent_proj.norm() > 1e-12)
             tangent_proj.normalize();
 
-        Eigen::Vector3d x_axis;
-        if (i == 0)
-        {
-            if (tangent_proj.norm() > 1e-12)
-                x_axis = tangent_proj;
-            else
-                x_axis = fallbackTangent(z_axis);
-        }
-        else
-        {
-            x_axis = projectToPlane(prev_x, z_axis);
-
-            if (x_axis.norm() < 1e-12)
-            {
-                if (tangent_proj.norm() > 1e-12)
-                    x_axis = tangent_proj;
-                else
-                    x_axis = fallbackTangent(z_axis);
-            }
-            else
-            {
-                x_axis.normalize();
-            }
-
-            if (tangent_proj.norm() > 1e-12 && x_axis.dot(tangent_proj) < 0.0)
-                x_axis = -x_axis;
-        }
+        Eigen::Vector3d x_axis = makeReferenceXAxis(z_axis, tangent_proj, prev_x, has_prev_x);
 
         Eigen::Vector3d y_axis = z_axis.cross(x_axis);
         if (y_axis.norm() < 1e-12)
         {
-            x_axis = fallbackTangent(z_axis);
+            Eigen::Vector3d fallback_x = tangent_proj;
+            if (fallback_x.norm() < 1e-12)
+                fallback_x = Eigen::Vector3d(1.0, 0.0, 0.0);
+
+            fallback_x = projectToPlane(fallback_x, z_axis);
+            if (fallback_x.norm() < 1e-12)
+                fallback_x = Eigen::Vector3d(0.0, 1.0, 0.0);
+
+            fallback_x.normalize();
+            x_axis = fallback_x;
             y_axis = z_axis.cross(x_axis);
         }
 
@@ -191,6 +210,8 @@ nrs_path2::msg::Waypoints buildWaypointsFromPointsAndNormals(
         x_axis = y_axis.cross(z_axis).normalized();
 
         tf2::Quaternion q = axesToQuaternion(x_axis, y_axis, z_axis);
+        q.normalize();
+
         if (quatDot(q, prev_q) < 0.0)
             q = tf2::Quaternion(-q.x(), -q.y(), -q.z(), -q.w());
 
@@ -210,6 +231,7 @@ nrs_path2::msg::Waypoints buildWaypointsFromPointsAndNormals(
 
         prev_x = x_axis;
         prev_q = q;
+        has_prev_x = true;
     }
 
     return waypoints;
@@ -375,9 +397,7 @@ nrs_path2::msg::Waypoints nrs_interpolation::interpolateEnd2End(
     double total_distance = cumulative_distances.back();
 
     if (total_distance < 1e-12)
-    {
         return buildWaypointsFromPointsAndNormals(original_points, original_normals, fx, fy, fz);
-    }
 
     std::vector<geometry_msgs::msg::Point> resampled_points;
     std::vector<Eigen::Vector3d> resampled_normals;
@@ -405,7 +425,7 @@ nrs_path2::msg::Waypoints nrs_interpolation::interpolateEnd2End(
             interpolatePointLinear(original_points[i - 1], original_points[i], t);
 
         Eigen::Vector3d n =
-            interpolateNormalLinear(original_normals[i - 1], original_normals[i], t);
+            interpolateNormalSlerp(original_normals[i - 1], original_normals[i], t);
 
         if (n.dot(prev_resampled_normal) < 0.0)
             n = -n;
@@ -426,6 +446,7 @@ nrs_path2::msg::Waypoints nrs_interpolation::interpolateEnd2End(
     if ((toEigen(resampled_points.back()) - toEigen(original_points.back())).norm() > 1e-12)
     {
         resampled_points.push_back(original_points.back());
+
         Eigen::Vector3d n_last = original_normals.back();
         if (n_last.dot(prev_resampled_normal) < 0.0)
             n_last = -n_last;

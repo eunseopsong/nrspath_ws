@@ -356,6 +356,104 @@ def save_xyz(path, xyz, header_text):
     np.savetxt(path, xyz, header=header_text, comments="", fmt="%.6f")
 
 
+def _set_axes_equal(ax, x, y, z):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    z = np.asarray(z, dtype=float)
+
+    xmid = 0.5 * (x.min() + x.max())
+    ymid = 0.5 * (y.min() + y.max())
+    zmid = 0.5 * (z.min() + z.max())
+
+    xrange = x.max() - x.min()
+    yrange = y.max() - y.min()
+    zrange = z.max() - z.min()
+
+    radius = 0.5 * max(xrange, yrange, zrange, 1e-6)
+
+    ax.set_xlim(xmid - radius, xmid + radius)
+    ax.set_ylim(ymid - radius, ymid + radius)
+    ax.set_zlim(zmid - radius, zmid + radius)
+
+
+def visualize_mesh_and_waypoints(mesh, region_waypoints_dict, show_path=True, mesh_alpha=0.25):
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    tri_vertices = mesh.vertices[mesh.faces]
+    mesh_collection = Poly3DCollection(
+        tri_vertices,
+        alpha=mesh_alpha,
+        facecolor=(0.7, 0.7, 0.7, mesh_alpha),
+        edgecolor=(0.4, 0.4, 0.4, 0.15),
+        linewidths=0.1,
+    )
+    ax.add_collection3d(mesh_collection)
+
+    region_colors = {
+        1: "red",
+        2: "blue",
+        3: "green",
+        4: "orange",
+    }
+
+    all_pts = [mesh.vertices]
+
+    for region_id in [1, 2, 3, 4]:
+        pts = region_waypoints_dict.get(region_id, [])
+        if pts is None or len(pts) == 0:
+            continue
+
+        pts = np.asarray(pts, dtype=float)
+        all_pts.append(pts)
+
+        color = region_colors.get(region_id, "black")
+
+        ax.scatter(
+            pts[:, 0],
+            pts[:, 1],
+            pts[:, 2],
+            s=18,
+            c=color,
+            label=f"Region {region_id}",
+            depthshade=True,
+        )
+
+        if show_path and len(pts) >= 2:
+            ax.plot(
+                pts[:, 0],
+                pts[:, 1],
+                pts[:, 2],
+                color=color,
+                linewidth=1.2,
+                alpha=0.9,
+            )
+
+        if len(pts) >= 1:
+            ax.text(
+                pts[0, 0],
+                pts[0, 1],
+                pts[0, 2],
+                f"S{region_id}",
+                color=color,
+                fontsize=10,
+            )
+
+    all_pts = np.vstack(all_pts)
+    _set_axes_equal(ax, all_pts[:, 0], all_pts[:, 1], all_pts[:, 2])
+
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.set_title("Mesh and Generated Waypoints")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+
 def generate_waypoints_by_region(
     *,
     mesh_path: str,
@@ -382,6 +480,7 @@ def generate_waypoints_by_region(
     save_output: bool = False,
     save_combined: bool = False,
     save_hits_no_standoff: bool = False,
+    visualize: bool = False,
 ):
     pad_radius = 0.5 * pad_diameter
 
@@ -579,5 +678,11 @@ def generate_waypoints_by_region(
 
     for region_id in (1, 2, 3, 4):
         region_waypoints.setdefault(region_id, [])
+
+    if visualize:
+        try:
+            visualize_mesh_and_waypoints(mesh, region_waypoints)
+        except Exception as e:
+            print(f"[WARN] Visualization failed: {e}")
 
     return region_waypoints

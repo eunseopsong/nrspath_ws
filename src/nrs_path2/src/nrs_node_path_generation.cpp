@@ -7,8 +7,6 @@
 
 #include <fstream>
 #include <iostream>
-// 2025.05.13
-// 2026.03.26
 
 int main(int argc, char **argv)
 {
@@ -17,15 +15,19 @@ int main(int argc, char **argv)
 
     nrs_callback callback_handler(node);
 
-    // === Path Generation ===
     callback_handler.mesh_file_path = "/home/eunseop/isaac/isaac_save/surface/workpiece_8.stl";
 
-    callback_handler.geodesic_waypoints_file_path = "/home/eunseop/nrspath_ws/src/nrs_path2/data/geodesic_waypoints.txt";
+    callback_handler.geodesic_waypoints_file_path =
+        "/home/eunseop/nrspath_ws/src/nrs_path2/data/geodesic_waypoints.txt";
     callback_handler.geodesic_waypoints_pub =
         node->create_publisher<nrs_path2::msg::Waypoints>("geodesic_path", 10);
 
-    // === Path Interpolation ===
-    callback_handler.interpolated_waypoints_file_path = "/home/eunseop/dev_ws/src/y2_ur10skku_control/Y2RobMotion/txtcmd/cmd_continue9D.txt";
+    callback_handler.interpolated_waypoints_file_path =
+        "/home/eunseop/dev_ws/src/y2_ur10skku_control/Y2RobMotion/txtcmd/cmd_continue9D.txt";
+
+    callback_handler.interpolated_waypoints_debug_file_path =
+        "/home/eunseop/dev_ws/src/y2_ur10skku_control/Y2RobMotion/txtcmd/cmd_continue9D_debug.txt";
+
     callback_handler.desired_interval = 0.00004;
     callback_handler.fx = 0.0;
     callback_handler.fy = 0.0;
@@ -33,7 +35,6 @@ int main(int argc, char **argv)
     callback_handler.interpolated_waypoints_pub =
         node->create_publisher<nrs_path2::msg::Waypoints>("interpolated_waypoints", 10);
 
-    // === Load Mesh ===
     Triangle_mesh tmesh;
     std::ifstream input(callback_handler.mesh_file_path, std::ios::binary);
     if (!input)
@@ -43,7 +44,6 @@ int main(int argc, char **argv)
     }
     callback_handler.n_geodesic.load_stl_file(input, tmesh);
 
-    // === Register Services ===
     node->create_service<std_srvs::srv::Empty>(
         "spline",
         std::bind(&nrs_callback::splinePathServiceCallback, &callback_handler,
@@ -64,7 +64,6 @@ int main(int argc, char **argv)
         std::bind(&nrs_callback::pathDeleteCallback, &callback_handler,
                   std::placeholders::_1, std::placeholders::_2));
 
-    // === Subscriptions ===
     auto sub_clicked = node->create_subscription<geometry_msgs::msg::PointStamped>(
         "/clicked_point", 10,
         [&callback_handler, &tmesh](const geometry_msgs::msg::PointStamped::SharedPtr msg)
@@ -106,7 +105,6 @@ int main(int argc, char **argv)
             }
         });
 
-    // === Visualization Subscriptions ===
     nrs_visualization visualizer;
     visualizer.node_ = node;
 
@@ -120,7 +118,6 @@ int main(int argc, char **argv)
         std::bind(static_cast<void (nrs_visualization::*)(geometry_msgs::msg::PointStamped::SharedPtr)>
             (&nrs_visualization::visualizeClickedPoint), &visualizer, std::placeholders::_1));
 
-    // === Info Log ===
     RCLCPP_INFO(node->get_logger(), "Combined nrs node started. Generation, interpolation and visualization functionalities are active.");
 
     rclcpp::spin(node);

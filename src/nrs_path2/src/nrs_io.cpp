@@ -3,11 +3,11 @@
 #include <sstream>
 #include <iostream>
 #include <cmath>
+#include <cstdlib>
 #include <Eigen/Geometry>
 
 namespace
 {
-    // rotvec (wx, wy, wz) -> rotation matrix
     Eigen::Matrix3d rotVecToMatrix(double wx, double wy, double wz)
     {
         Eigen::Vector3d w(wx, wy, wz);
@@ -23,7 +23,6 @@ namespace
         return aa.toRotationMatrix();
     }
 
-    // rotation matrix -> rotvec (wx, wy, wz)
     Eigen::Vector3d matrixToRotVec(const Eigen::Matrix3d &R_in)
     {
         Eigen::AngleAxisd aa(R_in);
@@ -35,6 +34,49 @@ namespace
         }
 
         return aa.axis() * angle;
+    }
+
+    Eigen::Matrix3d quaternionToMatrix(double qx, double qy, double qz, double qw)
+    {
+        const double norm = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+        if (norm < 1e-12 || std::isnan(norm))
+            return Eigen::Matrix3d::Identity();
+
+        Eigen::Quaterniond q(qw, qx, qy, qz);
+        q.normalize();
+        return q.toRotationMatrix();
+    }
+
+    Eigen::Matrix3d getFlatReferenceMatrix()
+    {
+        static const Eigen::Matrix3d R_flat = rotVecToMatrix(0.0, 0.0, 1.57);
+        return R_flat;
+    }
+
+    std::string shellQuote(const std::string &value)
+    {
+        std::string quoted = "'";
+        for (char c : value)
+        {
+            if (c == '\'')
+                quoted += "'\\''";
+            else
+                quoted += c;
+        }
+        quoted += "'";
+        return quoted;
+    }
+
+    bool toForceConPath(const std::string &local_path, std::string &remote_path)
+    {
+        constexpr const char *local_home = "/home/eunseop/";
+        constexpr const char *remote_home = "/home/nrs_forcecon/";
+
+        if (local_path.rfind(local_home, 0) != 0)
+            return false;
+
+        remote_path = std::string(remote_home) + local_path.substr(std::string(local_home).size());
+        return true;
     }
 }
 
@@ -57,52 +99,26 @@ void nrs_io::saveWaypointsToFile(const nrs_path2::msg::Waypoints &final_waypoint
         return;
     }
 
-    // ------------------------------------------------------------
-    // Flat STL 기준 보정용 reference
-    //
-    // 현재 시스템에서 flat surface를 저장했을 때 나온 raw rotvec:
-    //   (-1.20224,  2.90245, 0.0)
-    //
-    // 사용자가 원하는 flat 기준 export rotvec:
-    //   (0.0, 0.0, 1.57)
-    //
-    // R_fix * R_raw_flat = R_des_flat
-    // ------------------------------------------------------------
-    constexpr double raw_flat_wx = -1.20224;
-    constexpr double raw_flat_wy =  2.90245;
-    constexpr double raw_flat_wz =  0.0;
-
-    constexpr double des_flat_wx = 0.0;
-    constexpr double des_flat_wy = 0.0;
-    constexpr double des_flat_wz = 1.57;
-
-    const Eigen::Matrix3d R_raw_flat = rotVecToMatrix(raw_flat_wx, raw_flat_wy, raw_flat_wz);
-    const Eigen::Matrix3d R_des_flat = rotVecToMatrix(des_flat_wx, des_flat_wy, des_flat_wz);
-
-    const Eigen::Matrix3d R_fix = R_des_flat * R_raw_flat.transpose();
-
     for (size_t i = 0; i < final_waypoints.waypoints.size(); ++i)
     {
         const auto &wp = final_waypoints.waypoints[i];
 
-        // 1) quaternion -> raw rotvec
-        double raw_wx = 0.0, raw_wy = 0.0, raw_wz = 0.0;
-        n_math.quaternionToRotVec(wp.qx, wp.qy, wp.qz, wp.qw, raw_wx, raw_wy, raw_wz);
+        Eigen::Matrix3d R_cur = quaternionToMatrix(wp.qx, wp.qy, wp.qz, wp.qw);
+        Eigen::Matrix3d R_flat = getFlatReferenceMatrix();
 
-        // 2) raw rotvec -> rotation matrix
-        Eigen::Matrix3d R_raw = rotVecToMatrix(raw_wx, raw_wy, raw_wz);
+        Eigen::Vector3d z_cur = R_cur.col(2).normalized();
+        Eigen::Vector3d z_flat = R_flat.col(2).normalized();
 
-        // 3) apply fixed alignment
-        Eigen::Matrix3d R_aligned = R_fix * R_raw;
+        Eigen::Quaterniond q_tilt = Eigen::Quaterniond::FromTwoVectors(z_flat, z_cur);
+        q_tilt.normalize();
 
-        // 4) aligned rotation matrix -> rotvec
-        Eigen::Vector3d w_aligned = matrixToRotVec(R_aligned);
+        Eigen::Matrix3d R_export = q_tilt.toRotationMatrix() * R_flat;
+        Eigen::Vector3d w_export = matrixToRotVec(R_export);
 
-        double wx = w_aligned.x();
-        double wy = w_aligned.y();
-        double wz = w_aligned.z();
+        double wx = w_export.x();
+        double wy = w_export.y();
+        double wz = w_export.z();
 
-        // meter -> millimeter
         double x_mm = wp.x * 1000.0;
         double y_mm = wp.y * 1000.0;
         double z_mm = wp.z * 1000.0;
@@ -116,16 +132,106 @@ void nrs_io::saveWaypointsToFile(const nrs_path2::msg::Waypoints &final_waypoint
     std::cout << "Waypoints saved to " << file_path << std::endl;
 }
 
+void nrs_io::saveWaypointsToFlatDebugFile(const nrs_path2::msg::Waypoints &final_waypoints,
+                                          const std::string &file_path)
+{
+    std::ofstream file(file_path);
+    if (!file.is_open())
+    {
+        std::cerr << "Error: Unable to open debug file " << file_path << std::endl;
+        return;
+    }
+
+    const Eigen::Matrix3d R_flat = getFlatReferenceMatrix();
+    const Eigen::Vector3d z_flat = R_flat.col(2).normalized();
+
+    for (size_t i = 0; i < final_waypoints.waypoints.size(); ++i)
+    {
+        const auto &wp = final_waypoints.waypoints[i];
+
+        Eigen::Matrix3d R_cur = quaternionToMatrix(wp.qx, wp.qy, wp.qz, wp.qw);
+        Eigen::Vector3d z_cur = R_cur.col(2).normalized();
+
+        // flat 기준 z축 -> 현재 z축 으로 가는 최소 회전(tilt only)
+        Eigen::Quaterniond q_tilt = Eigen::Quaterniond::FromTwoVectors(z_flat, z_cur);
+        q_tilt.normalize();
+
+        Eigen::Matrix3d R_export = q_tilt.toRotationMatrix() * R_flat;
+        Eigen::Vector3d w_export = matrixToRotVec(R_export);
+
+        double wx_dbg = w_export.x();
+        double wy_dbg = w_export.y();
+        double wz_dbg = w_export.z();
+
+        double x_mm = wp.x * 1000.0;
+        double y_mm = wp.y * 1000.0;
+        double z_mm = wp.z * 1000.0;
+
+        file << x_mm << " " << y_mm << " " << z_mm << " "
+             << wx_dbg << " " << wy_dbg << " " << wz_dbg << " "
+             << wp.fx << " " << wp.fy << " " << wp.fz << "\n";
+    }
+
+    file.close();
+    std::cout << "Debug waypoints saved to " << file_path << std::endl;
+}
+
+bool nrs_io::copyFileToForceConSamePath(const std::string &file_path)
+{
+    constexpr const char *remote = "nrs_forcecon@192.168.0.151";
+
+    std::string remote_file_path;
+    if (!toForceConPath(file_path, remote_file_path))
+    {
+        std::cerr << "Warning: skipping remote copy for unsupported local path: "
+                  << file_path << std::endl;
+        return false;
+    }
+
+    const fs::path remote_path(remote_file_path);
+    const std::string remote_dir = remote_path.parent_path().string();
+
+    const std::string mkdir_command =
+        "ssh -o BatchMode=yes -o ConnectTimeout=5 " +
+        std::string(remote) + " " +
+        shellQuote("mkdir -p " + shellQuote(remote_dir));
+
+    int ret = std::system(mkdir_command.c_str());
+    if (ret != 0)
+    {
+        std::cerr << "Warning: failed to create remote directory "
+                  << remote << ":" << remote_dir
+                  << " (ssh exit code: " << ret << ")" << std::endl;
+        return false;
+    }
+
+    const std::string copy_command =
+        "scp -o BatchMode=yes -o ConnectTimeout=5 " +
+        shellQuote(file_path) + " " +
+        std::string(remote) + ":" + shellQuote(remote_file_path);
+
+    ret = std::system(copy_command.c_str());
+    if (ret != 0)
+    {
+        std::cerr << "Warning: failed to copy " << file_path
+                  << " to " << remote << ":" << remote_file_path
+                  << " (scp exit code: " << ret << ")" << std::endl;
+        return false;
+    }
+
+    std::cout << "Copied " << file_path
+              << " to " << remote << ":" << remote_file_path << std::endl;
+    return true;
+}
+
 void nrs_io::sendFile(const std::string &file_path,
                       const rclcpp::Publisher<std_msgs::msg::String>::SharedPtr &file_pub,
                       const rclcpp::Node::SharedPtr &node)
-//// void nrs_io::sendFile(const std::string &file_path, ros::Publisher &file_pub)
 {
     std::ifstream file(file_path);
     if (!file.is_open())
     {
         RCLCPP_ERROR(node->get_logger(), "Failed to open file: %s", file_path.c_str());
-        //// ROS_ERROR("Failed to open file: %s", file_path.c_str());
         return;
     }
 

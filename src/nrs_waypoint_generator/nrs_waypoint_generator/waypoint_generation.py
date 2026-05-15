@@ -1,8 +1,13 @@
 import rclpy
+import trimesh
+
 from rclpy.node import Node
 from geometry_msgs.msg import PointStamped
 
-from .waypoint_core import generate_waypoints_by_region
+from .waypoint_core import (
+    generate_waypoints_by_region,
+    visualize_mesh_and_waypoints,
+)
 
 
 class GenerateAndPublishClickedPointNode(Node):
@@ -27,6 +32,11 @@ class GenerateAndPublishClickedPointNode(Node):
 
         self.pub_ = self.create_publisher(PointStamped, "/clicked_point", 10)
 
+        self.region_waypoints = {}
+        self.waypoints = []
+        self.index = 0
+        self.timer = None
+
         if self.region_id not in [1, 2, 3, 4]:
             self.get_logger().error("region_id must be one of 1, 2, 3, 4")
             return
@@ -35,25 +45,29 @@ class GenerateAndPublishClickedPointNode(Node):
             self.get_logger().error("Parameter 'mesh' is empty.")
             return
 
+        if self.publish_rate_hz <= 0.0:
+            self.get_logger().error("publish_rate_hz must be > 0")
+            return
+
         self.get_logger().info(f"Mesh: {self.mesh_path}")
         self.get_logger().info(f"Region: {self.region_id}")
 
         try:
-            region_waypoints = generate_waypoints_by_region(
+            self.region_waypoints = generate_waypoints_by_region(
                 mesh_path=self.mesh_path,
                 save_output=self.save_output,
                 out_dir=self.output_dir,
+                visualize=False,   # 생성 직후가 아니라 publish 끝난 뒤 시각화
             )
         except Exception as e:
             self.get_logger().error(f"Waypoint generation failed: {e}")
             return
 
-        if self.region_id not in region_waypoints:
+        if self.region_id not in self.region_waypoints:
             self.get_logger().error(f"Region {self.region_id} not found in generated result.")
             return
 
-        self.waypoints = region_waypoints[self.region_id]
-        self.index = 0
+        self.waypoints = self.region_waypoints[self.region_id]
 
         if len(self.waypoints) == 0:
             self.get_logger().error(f"Region {self.region_id} has no waypoints.")
@@ -68,9 +82,25 @@ class GenerateAndPublishClickedPointNode(Node):
 
         self.init_ok = True
 
+    def visualize_after_publish(self):
+        try:
+            self.get_logger().info("Loading mesh for visualization...")
+            mesh = trimesh.load_mesh(self.mesh_path, force="mesh")
+            self.get_logger().info("Opening 3D visualization window...")
+            visualize_mesh_and_waypoints(mesh, self.region_waypoints)
+        except Exception as e:
+            self.get_logger().warn(f"Visualization failed: {e}")
+
     def on_timer(self):
         if self.index >= len(self.waypoints):
-            self.get_logger().info("All generated waypoints published. Shutting down.")
+            self.get_logger().info("All generated waypoints published.")
+
+            if self.timer is not None:
+                self.timer.cancel()
+
+            self.visualize_after_publish()
+
+            self.get_logger().info("Shutting down.")
             self.destroy_node()
             rclpy.shutdown()
             return
@@ -103,7 +133,11 @@ def main(args=None):
         rclpy.shutdown()
         return
 
-    rclpy.spin(node)
-    if rclpy.ok():
-        node.destroy_node()
-        rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()

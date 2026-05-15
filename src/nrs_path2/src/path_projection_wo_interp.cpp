@@ -205,7 +205,7 @@ static tf2::Quaternion computeOrientationOnSurface(
 
   Kernel::Vector_3 n = loc[0]*n0 + loc[1]*n1 + loc[2]*n2;
 
-  tf2::Vector3 z_axis(-n.x(), -n.y(), -n.z());
+  tf2::Vector3 z_axis(n.x(), n.y(), n.z());
   if (z_axis.length() < 1e-12) {
     tf2::Quaternion q_ident;
     q_ident.setRPY(0,0,0);
