@@ -1,5 +1,6 @@
 #include "path_projection.h"
 #include <rclcpp/rclcpp.hpp>
+#include <algorithm>
 
 //////////////////////////////////////
 // 전방 선언 (로거 전달 안 하도록 표준출력/에러 사용)
@@ -378,6 +379,42 @@ Waypoints interpolatexyzrpy(const Waypoints &input, double desired_interval) {
 void clearFile(const std::string &file_path) {
   std::ofstream file(file_path, std::ofstream::trunc);
   if (!file.is_open()) std::cerr << "Failed to open file: " << file_path << std::endl;
+}
+
+double waypointDistance(const Waypoint &a, const Waypoint &b)
+{
+  const double dx = a.x - b.x;
+  const double dy = a.y - b.y;
+  const double dz = a.z - b.z;
+  return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+void applyFzRamp(Waypoints &wps, double target_fz)
+{
+  constexpr double kRampDistance = 0.010;  // 10 mm contact/release ramp
+
+  if (wps.waypoints.empty()) return;
+
+  std::vector<double> distances(wps.waypoints.size(), 0.0);
+  for (size_t i = 1; i < wps.waypoints.size(); ++i) {
+    distances[i] = distances[i - 1] + waypointDistance(wps.waypoints[i - 1], wps.waypoints[i]);
+  }
+
+  const double total_distance = distances.back();
+  const double ramp_distance = std::min(kRampDistance, 0.5 * total_distance);
+
+  for (size_t i = 0; i < wps.waypoints.size(); ++i) {
+    double scale = 1.0;
+    if (ramp_distance > 1e-12) {
+      const double ramp_up = distances[i] / ramp_distance;
+      const double ramp_down = (total_distance - distances[i]) / ramp_distance;
+      scale = std::max(0.0, std::min(1.0, std::min(ramp_up, ramp_down)));
+    }
+
+    wps.waypoints[i].fx = 0.0;
+    wps.waypoints[i].fy = 0.0;
+    wps.waypoints[i].fz = target_fz * scale;
+  }
 }
 
 void saveWaypointsToFile(const Waypoints &wps, const std::string &file_path) {
@@ -811,12 +848,7 @@ private:
     double accel_for_visual = 0.05;
     visual_final = ACCProfiling(visual_final, sampling_time_, starting_time_, last_resting_time_, accel_for_visual, time_counter_);
 
-    // 시각화 traj에 힘/토크 채워넣기 (fz=10N 고정) -> interpolatexyzrpy()가 fx/fy/fz까지 보간할 수 있도록
-    for (auto& wp : visual_final.waypoints) {
-      wp.fx = 0.0;
-      wp.fy = 0.0;
-      wp.fz = 10.0;
-    }
+    applyFzRamp(visual_final, 10.0);
 
     // ---- trajectory density scaling for hand_g_recording.txt ----
     const double interval_effective = desired_interval_ / std::max(1.0, density_multiplier_);
@@ -856,6 +888,7 @@ private:
             interval_effective, desired_interval_, density_multiplier_);
 
     control_final = interpolatexyzrpy(control_final, interval_effective);
+    applyFzRamp(control_final, 10.0);
 
     int approach_size = static_cast<int>(control_approach_wps.waypoints.size());
     int original_size = static_cast<int>(control_original_wps.waypoints.size());

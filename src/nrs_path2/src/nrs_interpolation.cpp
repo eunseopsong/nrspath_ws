@@ -26,6 +26,50 @@ Eigen::Vector3d projectToPlane(const Eigen::Vector3d &v, const Eigen::Vector3d &
     return v - v.dot(normal) * normal;
 }
 
+double waypointDistance(const nrs_path2::msg::Waypoint &a,
+                        const nrs_path2::msg::Waypoint &b)
+{
+    const double dx = a.x - b.x;
+    const double dy = a.y - b.y;
+    const double dz = a.z - b.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+void applyFzRamp(nrs_path2::msg::Waypoints &waypoints,
+                 double fx, double fy, double target_fz)
+{
+    constexpr double kRampDistance = 0.010;  // 10 mm contact/release ramp
+
+    if (waypoints.waypoints.empty())
+        return;
+
+    std::vector<double> distances(waypoints.waypoints.size(), 0.0);
+    for (size_t i = 1; i < waypoints.waypoints.size(); ++i)
+    {
+        distances[i] = distances[i - 1] +
+                       waypointDistance(waypoints.waypoints[i - 1], waypoints.waypoints[i]);
+    }
+
+    const double total_distance = distances.back();
+    const double ramp_distance = std::min(kRampDistance, 0.5 * total_distance);
+
+    for (size_t i = 0; i < waypoints.waypoints.size(); ++i)
+    {
+        double scale = 1.0;
+        if (ramp_distance > 1e-12)
+        {
+            const double ramp_up = distances[i] / ramp_distance;
+            const double ramp_down = (total_distance - distances[i]) / ramp_distance;
+            scale = std::min(1.0, std::min(ramp_up, ramp_down));
+            scale = std::max(0.0, scale);
+        }
+
+        waypoints.waypoints[i].fx = fx;
+        waypoints.waypoints[i].fy = fy;
+        waypoints.waypoints[i].fz = target_fz * scale;
+    }
+}
+
 tf2::Quaternion axesToQuaternion(const Eigen::Vector3d &x_axis,
                                  const Eigen::Vector3d &y_axis,
                                  const Eigen::Vector3d &z_axis)
@@ -397,7 +441,11 @@ nrs_path2::msg::Waypoints nrs_interpolation::interpolateEnd2End(
     double total_distance = cumulative_distances.back();
 
     if (total_distance < 1e-12)
-        return buildWaypointsFromPointsAndNormals(original_points, original_normals, fx, fy, fz);
+    {
+        output = buildWaypointsFromPointsAndNormals(original_points, original_normals, fx, fy, fz);
+        applyFzRamp(output, fx, fy, fz);
+        return output;
+    }
 
     std::vector<geometry_msgs::msg::Point> resampled_points;
     std::vector<Eigen::Vector3d> resampled_normals;
@@ -454,5 +502,6 @@ nrs_path2::msg::Waypoints nrs_interpolation::interpolateEnd2End(
     }
 
     output = buildWaypointsFromPointsAndNormals(resampled_points, resampled_normals, fx, fy, fz);
+    applyFzRamp(output, fx, fy, fz);
     return output;
 }
