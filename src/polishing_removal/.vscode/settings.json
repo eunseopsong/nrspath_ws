@@ -1,0 +1,22 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/eunseop/nrspath_ws/build/polishing_removal",
+        "/home/eunseop/nrspath_ws/install/polishing_removal/lib/python3.10/site-packages",
+        "/home/eunseop/nrspath_ws/build/nrs_waypoint_generator",
+        "/home/eunseop/nrspath_ws/install/nrs_waypoint_generator/lib/python3.10/site-packages",
+        "/home/eunseop/nrspath_ws/install/nrs_path2/local/lib/python3.10/dist-packages",
+        "/home/eunseop/dev_ws/install/y2_rob_motion_interfaces/local/lib/python3.10/dist-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/eunseop/nrspath_ws/build/polishing_removal",
+        "/home/eunseop/nrspath_ws/install/polishing_removal/lib/python3.10/site-packages",
+        "/home/eunseop/nrspath_ws/build/nrs_waypoint_generator",
+        "/home/eunseop/nrspath_ws/install/nrs_waypoint_generator/lib/python3.10/site-packages",
+        "/home/eunseop/nrspath_ws/install/nrs_path2/local/lib/python3.10/dist-packages",
+        "/home/eunseop/dev_ws/install/y2_rob_motion_interfaces/local/lib/python3.10/dist-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
+}

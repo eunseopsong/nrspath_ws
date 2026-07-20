@@ -15,7 +15,7 @@ int main(int argc, char **argv)
 
     nrs_callback callback_handler(node);
 
-    callback_handler.mesh_file_path = "/home/eunseop/isaac/isaac_save/surface/workpiece_8.stl";
+    callback_handler.mesh_file_path = "/home/eunseop/urp_data/sim_scan/tail_lamp_proxy_run2/reconstructed_gp3.stl";
 
     callback_handler.geodesic_waypoints_file_path =
         "/home/eunseop/nrspath_ws/src/nrs_path2/data/geodesic_waypoints.txt";

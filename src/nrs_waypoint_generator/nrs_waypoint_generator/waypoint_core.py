@@ -376,7 +376,19 @@ def _set_axes_equal(ax, x, y, z):
     ax.set_zlim(zmid - radius, zmid + radius)
 
 
-def visualize_mesh_and_waypoints(mesh, region_waypoints_dict, show_path=True, mesh_alpha=0.25):
+def visualize_mesh_and_waypoints(
+    mesh,
+    region_waypoints_dict,
+    show_path=True,
+    mesh_alpha=0.25,
+    output_path=None,
+    show=True,
+):
+    """Render a mesh and its waypoints, optionally saving the view as an image."""
+    if not show:
+        import matplotlib
+
+        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
@@ -449,9 +461,15 @@ def visualize_mesh_and_waypoints(mesh, region_waypoints_dict, show_path=True, me
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
     ax.set_title("Mesh and Generated Waypoints")
-    ax.legend()
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend()
     plt.tight_layout()
-    plt.show()
+    if output_path is not None:
+        fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
 
 
 def generate_waypoints_by_region(
@@ -460,7 +478,7 @@ def generate_waypoints_by_region(
     out_dir: str = "cross_corner_waypoints",
     pad_diameter: float = 0.025,
     overlap: float = 0.15,
-    step: float = 0.02,
+    step: float = 0.01,
     tool_axis: str = "+Z",
     standoff: float = 0.01,
     scan_dir: str = "auto",

@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'waypoint_generator = nrs_waypoint_generator.waypoint_generation:main',
+            'full_workpiece_waypoint_generator = nrs_waypoint_generator.full_workpiece_waypoint_node:main',
         ],
     },
 )
