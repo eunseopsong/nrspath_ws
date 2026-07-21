@@ -383,12 +383,9 @@ def visualize_mesh_and_waypoints(
     mesh_alpha=0.25,
     output_path=None,
     show=True,
+    block=True,
 ):
     """Render a mesh and its waypoints, optionally saving the view as an image."""
-    if not show:
-        import matplotlib
-
-        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
@@ -468,8 +465,10 @@ def visualize_mesh_and_waypoints(
     if output_path is not None:
         fig.savefig(output_path, dpi=200, bbox_inches="tight")
     if show:
-        plt.show()
-    plt.close(fig)
+        plt.show(block=block)
+    if not show or block:
+        plt.close(fig)
+    return fig if show and not block else None
 
 
 def generate_waypoints_by_region(

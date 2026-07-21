@@ -85,7 +85,7 @@ def generate_full_workpiece_waypoints(
     hit_mask, _, _ = batch_raycast_first_hit(mesh, origins, directions)
     valid_mask = hit_mask.reshape(len(ys), len(xs))
     safe_mask = erosion_mask_by_radius(
-        valid_mask, cell=grid_cell, radius=0.5 * pad_diameter
+        valid_mask, cell=grid_cell, radius=0.015
     )
 
     full_region = {
@@ -146,6 +146,7 @@ class FullWorkpieceWaypointNode(Node):
         self.visualize = bool(self.get_parameter("visualize").value)
         self.publisher = self.create_publisher(PointStamped, "/clicked_point", 10)
         self.timer = None
+        self.plot_figure = None
         self.index = 0
         self.init_ok = False
 
@@ -190,19 +191,28 @@ class FullWorkpieceWaypointNode(Node):
             )
             self.get_logger().info(f"Saved waypoints to {output_file}")
 
-        if bool(self.get_parameter("save_png").value):
-            png_file = Path(str(self.get_parameter("png_file").value))
+        save_png = bool(self.get_parameter("save_png").value)
+        png_file = Path(str(self.get_parameter("png_file").value)) if save_png else None
+        if save_png or self.visualize:
             try:
-                png_file.parent.mkdir(parents=True, exist_ok=True)
-                visualize_mesh_and_waypoints(
+                if png_file is not None:
+                    png_file.parent.mkdir(parents=True, exist_ok=True)
+                self.plot_figure = visualize_mesh_and_waypoints(
                     self.mesh,
                     {1: self.waypoints},
                     output_path=png_file,
-                    show=False,
+                    show=self.visualize,
+                    block=False,
                 )
-                self.get_logger().info(f"Saved waypoint preview PNG to {png_file.resolve()}")
+                if png_file is not None:
+                    self.get_logger().info(
+                        f"Saved waypoint preview PNG to {png_file.resolve()}"
+                    )
+                if self.visualize:
+                    self.get_logger().info("Opened waypoint visualization window")
             except Exception as exc:
-                self.get_logger().error(f"Failed to save waypoint preview PNG: {exc}")
+                self.get_logger().error(f"Failed to render waypoint preview: {exc}")
+                self.plot_figure = None
 
         self.get_logger().info(
             f"Generated {len(self.waypoints)} continuous waypoints from the complete STL"
@@ -211,11 +221,23 @@ class FullWorkpieceWaypointNode(Node):
         self.init_ok = True
 
     def _publish_next(self):
+        if self.plot_figure is not None:
+            try:
+                self.plot_figure.canvas.flush_events()
+            except Exception as exc:
+                self.get_logger().warning(f"Visualization window closed: {exc}")
+                self.plot_figure = None
+
         if self.index >= len(self.waypoints):
             self.timer.cancel()
             self.get_logger().info("All full-workpiece waypoints have been published")
-            if self.visualize:
-                visualize_mesh_and_waypoints(self.mesh, {1: self.waypoints})
+            if self.plot_figure is not None:
+                import matplotlib.pyplot as plt
+
+                self.get_logger().info(
+                    "Publishing finished; close the visualization window to exit"
+                )
+                plt.show()
             rclpy.shutdown()
             return
 
